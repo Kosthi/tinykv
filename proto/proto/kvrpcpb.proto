@@ -53,7 +53,6 @@ message RawScanRequest {
     // The maximum number of values read.
     uint32 limit = 3;
     string cf = 4;
-
 }
 
 message RawScanResponse {
