@@ -182,33 +182,77 @@ func (r *Raft) sendHeartbeat(to uint64) {
 
 // tick advances the internal logical clock by a single tick.
 func (r *Raft) tick() {
-	// Your Code Here (2A).
+	r.electionElapsed++
+
+	switch r.State {
+	case StateFollower:
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+			if err != nil {
+				return
+			}
+		}
+		break
+	case StateCandidate:
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+			if err != nil {
+				return
+			}
+		}
+		break
+	case StateLeader:
+		// 如果是 leader 还要增加心跳计时
+		r.heartbeatTimeout++
+		if r.heartbeatElapsed >= r.heartbeatTimeout {
+			r.heartbeatElapsed = 0
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgBeat})
+			if err != nil {
+				return
+			}
+		}
+		if r.electionElapsed >= r.electionTimeout {
+			r.electionElapsed = 0
+			err := r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
+			if err != nil {
+				return
+			}
+		}
+		break
+	}
 }
 
 // becomeFollower transform this peer's state to Follower
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	// Your Code Here (2A).
+
 }
 
 // becomeCandidate transform this peer's state to candidate
 func (r *Raft) becomeCandidate() {
-	// Your Code Here (2A).
+	r.State = StateCandidate
 }
 
 // becomeLeader transform this peer's state to leader
 func (r *Raft) becomeLeader() {
 	// Your Code Here (2A).
 	// NOTE: Leader should propose a noop entry on its term
+	r.State = StateLeader
 }
 
 // Step the entrance of handle message, see `MessageType`
 // on `eraftpb.proto` for what msgs should be handled
 func (r *Raft) Step(m pb.Message) error {
-	// Your Code Here (2A).
 	switch r.State {
 	case StateFollower:
+
 	case StateCandidate:
 	case StateLeader:
+		if m.MsgType == pb.MessageType_MsgBeat {
+			r.
+			return nil
+		}
 	}
 	return nil
 }
