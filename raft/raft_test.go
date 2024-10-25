@@ -72,6 +72,7 @@ func TestProgressLeader2AB(t *testing.T) {
 	}
 }
 
+// TestLeaderElection2AA 测试选举是否能正确选出领导者
 func TestLeaderElection2AA(t *testing.T) {
 	var cfg func(*Config)
 	tests := []struct {
@@ -79,14 +80,15 @@ func TestLeaderElection2AA(t *testing.T) {
 		state   StateType
 		expTerm uint64
 	}{
-		{newNetworkWithConfig(cfg, nil, nil, nil), StateLeader, 1},
-		{newNetworkWithConfig(cfg, nil, nil, nopStepper), StateLeader, 1},
-		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper), StateCandidate, 1},
-		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil), StateCandidate, 1},
-		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil, nil), StateLeader, 1},
+		{newNetworkWithConfig(cfg, nil, nil, nil), StateLeader, 1},                         // 赢得 3/3 枚选票，节点 1 成为领导者
+		{newNetworkWithConfig(cfg, nil, nil, nopStepper), StateLeader, 1},                  // 赢得 2/3 枚选票，节点 1 成为领导者
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper), StateCandidate, 1},        // 赢得 1/3 枚选票，其他节点宕机，节点 1 保持为候选者
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil), StateCandidate, 1},   // 赢得 2/4 枚选票，其他节点宕机，节点 1 保持为候选者
+		{newNetworkWithConfig(cfg, nil, nopStepper, nopStepper, nil, nil), StateLeader, 1}, // 赢得 3/5 枚选票，其他节点宕机，节点 1 成为领导者
 	}
 
 	for i, tt := range tests {
+		// 节点 1 发起选举，因为该测试没有其他节点发起选举，节点 1 会在赢得多数票的情况下成为领导者
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		sm := tt.network.peers[1].(*Raft)
 		if sm.State != tt.state {
@@ -101,10 +103,13 @@ func TestLeaderElection2AA(t *testing.T) {
 // testLeaderCycle verifies that each node in a cluster can campaign
 // and be elected in turn. This ensures that elections work when not
 // starting from a clean slate (as they do in TestLeaderElection)
+// testLeaderCycle 验证集群中的每个节点都能轮流竞选和当选为领导者。
+// 这确保了在不是从干净的状态开始时，选举功能正常（如在 TestLeaderElection 中所做的那样）。
 func TestLeaderCycle2AA(t *testing.T) {
 	var cfg func(*Config)
 	n := newNetworkWithConfig(cfg, nil, nil, nil)
 	for campaignerID := uint64(1); campaignerID <= 3; campaignerID++ {
+		// 节点 campaignerID 发起选举，会成为领导者，而其他节点成为跟随者
 		n.send(pb.Message{From: campaignerID, To: campaignerID, MsgType: pb.MessageType_MsgHup})
 
 		for _, peer := range n.peers {
@@ -188,6 +193,7 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	}
 }
 
+// TestVoteFromAnyState2AA 测试选举中不同状态的节点收到投票请求，能否正确改变状态并按照先来先服务的原则投票
 func TestVoteFromAnyState2AA(t *testing.T) {
 	vt := pb.MessageType_MsgRequestVote
 	vt_resp := pb.MessageType_MsgRequestVoteResponse
@@ -208,8 +214,10 @@ func TestVoteFromAnyState2AA(t *testing.T) {
 
 		// Note that setting our state above may have advanced r.Term
 		// past its initial value.
+		// 注意，上面设置我们的状态可能已经将 r.Term 推进到其初始值之后。
 		newTerm := r.Term + 1
 
+		// 选举投票请求，从节点 2 发给节点 1
 		msg := pb.Message{
 			From:    2,
 			To:      1,
@@ -218,29 +226,37 @@ func TestVoteFromAnyState2AA(t *testing.T) {
 			LogTerm: newTerm,
 			Index:   42,
 		}
+		// 当前节点处理选举投票请求
 		if err := r.Step(msg); err != nil {
 			t.Errorf("%s,%s: Step failed: %s", vt, st, err)
 		}
+		// 当前节点应该对选票投票请求做出回复
 		if len(r.msgs) != 1 {
 			t.Errorf("%s,%s: %d response messages, want 1: %+v", vt, st, len(r.msgs), r.msgs)
 		} else {
 			resp := r.msgs[0]
+			// 消息类型应该是选举投票请求回复
 			if resp.MsgType != vt_resp {
 				t.Errorf("%s,%s: response message is %s, want %s",
 					vt, st, resp.MsgType, vt_resp)
 			}
+			// 按照先来先服务原则，不应该出现拒绝
 			if resp.Reject {
 				t.Errorf("%s,%s: unexpected rejection", vt, st)
 			}
 		}
 
 		// If this was a vote, we reset our state and term.
+		// 如果这是一次投票，我们会重置我们的状态和任期。
+		// 当前节点状态为初始状态跟随者
 		if r.State != StateFollower {
 			t.Errorf("%s,%s: state %s, want %s", vt, st, r.State, StateFollower)
 		}
+		// 当前节点任期要保持与新任期一致
 		if r.Term != newTerm {
 			t.Errorf("%s,%s: term %d, want %d", vt, st, r.Term, newTerm)
 		}
+		// 当前节点选票一定是投给了节点 2
 		if r.Vote != 2 {
 			t.Errorf("%s,%s: vote %d, want 2", vt, st, r.Vote)
 		}
@@ -480,6 +496,7 @@ func TestCandidateConcede2AB(t *testing.T) {
 	}
 }
 
+// TestSingleNodeCandidate2AA 测试单节点发起选举直接成为领导者
 func TestSingleNodeCandidate2AA(t *testing.T) {
 	tt := newNetwork(nil)
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
@@ -562,10 +579,10 @@ func TestProposal2AB(t *testing.T) {
 }
 
 // TestHandleMessageType_MsgAppend ensures:
-// 1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
-// 2. If an existing entry conflicts with a new one (same index but different terms),
-//    delete the existing entry and all that follow it; append any new entries not already in the log.
-// 3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+//  1. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm.
+//  2. If an existing entry conflicts with a new one (same index but different terms),
+//     delete the existing entry and all that follow it; append any new entries not already in the log.
+//  3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
 func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	tests := []struct {
 		m       pb.Message
@@ -758,6 +775,8 @@ func TestCandidateResetTermMessageType_MsgAppend2AA(t *testing.T) {
 // testCandidateResetTerm tests when a candidate receives a
 // MessageType_MsgHeartbeat or MessageType_MsgAppend from leader, "Step" resets the term
 // with leader's and reverts back to follower.
+// testCandidateResetTerm 测试当候选者收到来自领导者的 MessageType_MsgHeartbeat 或 MessageType_MsgAppend 时，
+// "Step" 会将任期重置为领导者的任期，并回退到跟随者状态。
 func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 	a := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
 	b := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
@@ -777,6 +796,7 @@ func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 	}
 
 	// isolate 3 and increase term in rest
+	// 隔离节点 3，并在其余节点中增加任期
 	nt.isolate(3)
 
 	nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
@@ -789,14 +809,17 @@ func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 		t.Errorf("state = %s, want %s", b.State, StateFollower)
 	}
 
+	// 推进时间直到节点 c 发起选举
 	for c.State != StateCandidate {
 		c.tick()
 	}
 
+	// 节点 c 从隔离中恢复
 	nt.recover()
 
 	// leader sends to isolated candidate
 	// and expects candidate to revert to follower
+	// 领导者发送消息给孤立的候选者，并期望候选者重新转变为追随者
 	nt.send(pb.Message{From: 1, To: 3, Term: a.Term, MsgType: mt})
 
 	if c.State != StateFollower {
@@ -804,6 +827,7 @@ func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 	}
 
 	// follower c term is reset with leader's
+	// 跟随者 c 的任期随领导者的任期重置
 	if a.Term != c.Term {
 		t.Errorf("follower term expected same term as leader's %d, got %d", a.Term, c.Term)
 	}
@@ -814,6 +838,8 @@ func testCandidateResetTerm(t *testing.T, mt pb.MessageType) {
 // to become a candidate with an increased term. Then, the
 // candiate's response to late leader heartbeat forces the leader
 // to step down.
+// TestDisruptiveFollower 测试孤立的跟随者，在来自领导者的网络延迟情况下，选举时间超时，
+// 成为具有增加任期的候选者。然后，候选者对迟到的领导者心跳的响应迫使领导者退位。
 func TestDisruptiveFollower2AA(t *testing.T) {
 	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
 	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
@@ -845,12 +871,17 @@ func TestDisruptiveFollower2AA(t *testing.T) {
 	// this is to expedite campaign trigger when given larger
 	// election timeouts (e.g. multi-datacenter deploy)
 	// Or leader messages are being delayed while ticks elapse
+	// etcd 服务器中的 "advanceTicksForElection" 在重启时执行；
+	// 这可以加快在给定较大选举超时时的选举触发（例如，在多数据中心部署时）。
+	// 或者在 ticks 经过而领导者消息被延迟的情况下。
 	for n3.State != StateCandidate {
 		n3.tick()
 	}
 
 	// n1 is still leader yet
 	// while its heartbeat to candidate n3 is being delayed
+	// n1 仍然是领导者，
+	// 而它向候选者 n3 发送的心跳消息却遭到延迟。
 
 	// check state
 	// n1.State == StateLeader
@@ -883,12 +914,17 @@ func TestDisruptiveFollower2AA(t *testing.T) {
 	// leader heartbeat finally arrives at candidate n3
 	// however, due to delayed network from leader, leader
 	// heartbeat was sent with lower term than candidate's
+	// 当 n3 发出的投票请求仍在排队时，来自领导者的心跳最终到达候选者 n3。
+	// 然而，由于来自领导者的网络延迟，领导者的心跳消息携带的任期（term）低于候选者的任期。
 	nt.send(pb.Message{From: 1, To: 3, Term: n1.Term, MsgType: pb.MessageType_MsgHeartbeat})
 
 	// then candidate n3 responds with "pb.MessageType_MsgAppendResponse" of higher term
 	// and leader steps down from a message with higher term
 	// this is to disrupt the current leader, so that candidate
 	// with higher term can be freed with following election
+	// 然后候选者 n3 用更高的任期回应 "pb.MessageType_MsgAppendResponse"，
+	// 而领导者则因任期更高的信息而自我卸任。
+	// 这样做是为了影响当前领导者，使得具备更高任期的候选者可以在后续选举中得到自由。
 
 	// check state
 	if n1.State != StateFollower {
@@ -947,6 +983,7 @@ func TestHeartbeatUpdateCommit2AB(t *testing.T) {
 }
 
 // tests the output of the state machine when receiving MessageType_MsgBeat
+// 测试状态机在接收到 MessageType_MsgBeat 时的输出。
 func TestRecvMessageType_MsgBeat2AA(t *testing.T) {
 	tests := []struct {
 		state StateType
@@ -954,6 +991,7 @@ func TestRecvMessageType_MsgBeat2AA(t *testing.T) {
 	}{
 		{StateLeader, 2},
 		// candidate and follower should ignore MessageType_MsgBeat
+		// 候选者和跟随者应该忽略 MessageType_MsgBeat 消息。
 		{StateCandidate, 0},
 		{StateFollower, 0},
 	}
@@ -1183,6 +1221,7 @@ func TestRemoveNode3A(t *testing.T) {
 	}
 }
 
+// 测试单节点选举直接成为领导者，且领导者即使收到 MsgHup 消息也不直接发起选举，直接忽略
 func TestCampaignWhileLeader2AA(t *testing.T) {
 	cfg := newTestConfig(1, []uint64{1}, 5, 1, NewMemoryStorage())
 	r := newRaft(cfg)
@@ -1191,6 +1230,7 @@ func TestCampaignWhileLeader2AA(t *testing.T) {
 	}
 	// We don't call campaign() directly because it comes after the check
 	// for our current state.
+	// 我们不直接调用 campaign()，因为它是在检查当前状态之后执行的。
 	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	if r.State != StateLeader {
 		t.Errorf("expected single-node election to become leader but got %s", r.State)
@@ -1473,6 +1513,7 @@ func TestTransferNonMember3A(t *testing.T) {
 
 // TestSplitVote verifies that after split vote, cluster can complete
 // election in next round.
+// TestSplitVote 验证在分裂选票后，因为随机选举超时，集群能在下一轮完成选举。
 func TestSplitVote2AA(t *testing.T) {
 	n1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
 	n2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
@@ -1486,6 +1527,7 @@ func TestSplitVote2AA(t *testing.T) {
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 
 	// simulate leader down. followers start split vote.
+	// 模拟领导者失效。跟随者开始进行分裂投票。
 	nt.isolate(1)
 	nt.send([]pb.Message{
 		{From: 2, To: 2, MsgType: pb.MessageType_MsgHup},
@@ -1517,6 +1559,7 @@ func TestSplitVote2AA(t *testing.T) {
 	}
 
 	// node 2 election timeout first
+	// 假设节点 2 首先发生选举超时
 	nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
 
 	// check whether the term values are expected
@@ -1629,7 +1672,9 @@ func newNetworkWithConfig(configFunc func(*Config), peers ...stateMachine) *netw
 	}
 }
 
+// 模拟同一时刻消息的收发
 func (nw *network) send(msgs ...pb.Message) {
+	// 循环处理节点发出和收到的消息直到没有任何消息需要处理
 	for len(msgs) > 0 {
 		m := msgs[0]
 		p := nw.peers[m.To]
@@ -1698,6 +1743,7 @@ type connem struct {
 
 type blackHole struct{}
 
+// 无操作，模拟机器宕机
 func (blackHole) Step(pb.Message) error      { return nil }
 func (blackHole) readMessages() []pb.Message { return nil }
 
