@@ -17,9 +17,8 @@ package raft
 import (
 	"errors"
 	"fmt"
-	"math/rand"
-
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math/rand"
 )
 
 const Debug = false
@@ -353,6 +352,10 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 		Reject:  reject,
 	}
 	r.msgs = append(r.msgs, msg)
+
+	if Debug {
+		fmt.Printf("%x send requestVoteResponse to %x at term %d\n", r.id, to, r.Term)
+	}
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -568,7 +571,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 
 	// 检查接收到的领导者任期是否小于当前任期
 	if m.Term < r.Term {
-		// 如果领导者任期较小，返回一个失败的响应
+		// 如果领导者任期较小，拒绝并忽略该消息
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
@@ -603,39 +606,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	// Your Code Here (2A).
 	if Debug {
-		fmt.Printf("%x receive append from %x\n", r.id, m.From)
+		fmt.Printf("%x receive appendResponse from %x\n", r.id, m.From)
 	}
 
-	// 检查接收到的领导者任期是否小于当前任期
-	if m.Term < r.Term {
-		// 如果领导者任期较小，返回一个失败的响应
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		})
-		return
-	}
-
-	// 当前节点是跟随者，更新当前任期和领导者
-	// 当前节点非跟随者，重置状态，成为跟随者
-	if r.State == StateFollower {
-		r.Term = m.Term
-		r.Lead = m.From
-	} else {
+	// 如果接收到的节点任期比当前领导者节点的任期大，更新自己的任期，回退到跟随者
+	if m.Term > r.Term {
 		r.becomeFollower(m.Term, m.From)
 	}
-
-	// 发送追加条目成功响应
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-		Reject:  false,
-	})
 }
 
 // handleHeartbeat handle Heartbeat RPC request
@@ -652,6 +629,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.msgs = append(r.msgs, pb.Message{
 			MsgType: pb.MessageType_MsgHeartbeatResponse,
 			To:      m.From,
+			From:    r.id,
 			Term:    r.Term,
 		})
 		return
@@ -671,6 +649,7 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      m.From,
+		From:    r.id,
 		Term:    r.Term,
 	})
 }
