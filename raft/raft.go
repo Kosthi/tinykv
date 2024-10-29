@@ -16,12 +16,13 @@ package raft
 
 import (
 	"errors"
-	"fmt"
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"math"
 	"math/rand"
 )
 
-const Debug = false
+const Debug = true
 
 // None is a placeholder node ID used when there is no leader.
 // None 是当没有领导者时使用的占位符节点 ID。
@@ -268,7 +269,55 @@ func newRaft(c *Config) *Raft {
 // 如果发送了消息，则返回 true。
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	return false
+	var entries []*pb.Entry
+
+	peer := r.Prs[to]
+	prevLogIndex := peer.Next - 1
+	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
+	if err != nil {
+		log.Errorf("Failed to get term for index %d: %v", prevLogIndex, err)
+		return false
+	}
+
+	firstIndex := r.RaftLog.FirstIndex()
+	for i := peer.Next; i <= r.RaftLog.LastIndex(); i++ {
+		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
+	}
+
+	// 添加附加日志请求到待发送消息队列
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: prevLogTerm,
+		Index:   prevLogIndex,
+		Entries: entries,
+		Commit:  r.RaftLog.committed,
+	})
+	return true
+}
+
+// sendAppend 向指定节点发送一个追加条目 RPC，包括新的条目（如果有的话）和当前的提交索引。
+// 如果发送了消息，则返回 true。
+func (r *Raft) sendAllAppend() {
+	// Your Code Here (2A).
+	for peer := range r.Prs {
+		if peer != r.id {
+			r.sendAppend(peer)
+		}
+	}
+}
+
+func (r *Raft) sendAppendResponse(to uint64, lastIndex uint64, reject bool) {
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Index:   lastIndex,
+		Reject:  reject,
+	})
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -300,6 +349,7 @@ func (r *Raft) sendHeartbeatResponse(to uint64) {
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
 		To:      to,
+		From:    r.id,
 		Term:    r.Term,
 	})
 }
@@ -312,20 +362,26 @@ func (r *Raft) startElection() {
 	} else {
 		// 否则成为候选人，发起选举
 		r.becomeCandidate()
-		if Debug {
-			fmt.Printf("%x start election at term %d\n", r.id, r.Term)
-		}
+		log.Debugf("%d start election at term %d", r.id, r.Term)
 		r.sendAllRequestVote()
 	}
 }
 
 // sendRequestVote 向某节点发起投票请求
 func (r *Raft) sendRequestVote(to uint64) {
+	lastLogIndex := r.RaftLog.LastIndex()
+	lastLogTerm, err := r.RaftLog.Term(lastLogIndex)
+	if err != nil {
+		return
+	}
+
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgRequestVote,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		LogTerm: lastLogTerm,
+		Index:   lastLogIndex,
 	}
 
 	r.msgs = append(r.msgs, msg)
@@ -336,9 +392,7 @@ func (r *Raft) sendAllRequestVote() {
 	for peer := range r.Prs {
 		if peer != r.id {
 			r.sendRequestVote(peer)
-			if Debug {
-				fmt.Printf("%x send requestVote to %x at term %d\n", r.id, peer, r.Term)
-			}
+			log.Debugf("%d send requestVote to %d at term %d", r.id, peer, r.Term)
 		}
 	}
 }
@@ -354,7 +408,11 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 	r.msgs = append(r.msgs, msg)
 
 	if Debug {
-		fmt.Printf("%x send requestVoteResponse to %x at term %d\n", r.id, to, r.Term)
+		responseType := "granted"
+		if reject {
+			responseType = "rejected"
+		}
+		log.Debugf("%d send requestVoteResponse(%s) to %d at term %d", r.id, responseType, to, r.Term)
 	}
 }
 
@@ -433,9 +491,7 @@ func (r *Raft) reset(term uint64, vote uint64, state StateType, lead uint64) {
 // becomeFollower 将该节点的状态转换为跟随者。
 func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.reset(term, None, StateFollower, lead)
-	if Debug {
-		fmt.Printf("%x became follower at term %d\n", r.id, r.Term)
-	}
+	log.Debugf("%d became follower at term %d", r.id, r.Term)
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -444,9 +500,7 @@ func (r *Raft) becomeCandidate() {
 	// 当前节点任期自增，成为候选人，并给自己投票
 	r.reset(r.Term+1, r.id, StateCandidate, None)
 	r.votes[r.id] = true
-	if Debug {
-		fmt.Printf("%x became candidate at term %d\n", r.id, r.Term)
-	}
+	log.Debugf("%d became candidate at term %d", r.id, r.Term)
 }
 
 // becomeLeader transform this peer's state to leader
@@ -457,11 +511,35 @@ func (r *Raft) becomeLeader() {
 	// 注意：领导者应在其任期内提议一个无操作条目（noop entry）。
 	// 自己成为领导者
 	r.reset(r.Term, None, StateLeader, r.id)
-	if Debug {
-		fmt.Printf("%x became leader at term %d\n", r.id, r.Term)
+
+	// 追加一条空日志条目
+	r.appendEntry([]*pb.Entry{
+		{
+			EntryType: pb.EntryType_EntryNormal,
+		},
+	})
+
+	lastIndex := r.RaftLog.LastIndex()
+
+	// 初始化所有的节点 nextIndex 值为自己的最后一条日志的 index 加 1，matchIndex 为 0
+	for id, process := range r.Prs {
+		if id != r.id {
+			process.Match = 0
+			process.Next = lastIndex // 应该把空日志条目也发给跟随者
+		}
 	}
-	// 发送心跳给所有的其他节点
-	r.sendAllHeartbeat()
+
+	log.Debugf("%d became leader at term %d", r.id, r.Term)
+
+	// 集群只有单个节点时不会发送附加日志请求，领导者直接更新日志
+	if len(r.Prs) == 1 {
+		r.RaftLog.stabled++
+		r.RaftLog.committed++
+		// r.RaftLog.applied 不知道什么时候应用到状态机
+	} else {
+		// 发送附加条目请求给其他节点
+		r.sendAllAppend()
+	}
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -542,7 +620,8 @@ func (r *Raft) StepLeader(m pb.Message) error {
 	case pb.MessageType_MsgHup: // 领导者一般不会发起选举
 	case pb.MessageType_MsgBeat: // 领导者接收 Beat 消息向其他节点发生心跳
 		r.sendAllHeartbeat()
-	case pb.MessageType_MsgPropose: // 暂不处理
+	case pb.MessageType_MsgPropose: // 处理客户端的提议将数据附加至领导者的日志条目
+		r.handlePropose(m)
 	case pb.MessageType_MsgAppend: // 领导者处理追加条目请求，可能是其他任期的领导者发过来的
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse: // 领导者处理追加条目消息回复
@@ -565,53 +644,107 @@ func (r *Raft) StepLeader(m pb.Message) error {
 // handleAppendEntries 处理追加条目 RPC 请求。
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
-	if Debug {
-		fmt.Printf("%x receive append from %x\n", r.id, m.From)
-	}
+	log.Debugf("%d receive append(%v) from %d", r.id, m.Entries, m.From)
 
+	lastIndex := r.RaftLog.LastIndex()
 	// 检查接收到的领导者任期是否小于当前任期
 	if m.Term < r.Term {
 		// 如果领导者任期较小，拒绝并忽略该消息
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-			Reject:  true,
-		})
+		log.Debugf("%d reject append from %d due to stale term: received %d, current %d", r.id, m.From, m.Term, r.Term)
+		r.sendAppendResponse(m.From, lastIndex, true)
 		return
 	}
 
-	// 当前节点是跟随者，更新当前任期和领导者
-	// 当前节点非跟随者，重置状态，成为跟随者
-	if r.State == StateFollower {
-		r.Term = m.Term
-		r.Lead = m.From
-	} else {
+	// 更新当前节点的任期和领导者
+	if r.State != StateFollower {
+		log.Debugf("%d becoming follower of %d", r.id, m.From)
 		r.becomeFollower(m.Term, m.From)
 	}
 
-	// 发送追加条目成功响应
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgAppendResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-		Reject:  false,
-	})
+	// 更新节点的任期
+	r.Term = m.Term
+	r.Lead = m.From
+
+	prevLogTerm := m.LogTerm
+	prevLogIndex := m.Index
+
+	// 如果 prevLogIndex 超过节点的日志范围，拒绝
+	if prevLogIndex > lastIndex {
+		log.Debugf("%d reject append from %d due to prevLogIndex %d out of range, lastIndex %d", r.id, m.From, prevLogIndex, lastIndex)
+		r.sendAppendResponse(m.From, lastIndex, true)
+		return
+	}
+
+	// 当前节点日志中在 prevLogIndex 索引上的日志条目的任期与 prevLogTerm 不一致，拒绝
+	if term, err := r.RaftLog.Term(prevLogIndex); err != nil || term != prevLogTerm {
+		// 如果任期不一致，找到冲突的位置并修复日志
+		log.Debugf("%d reject append from %d due to term mismatch at index %d: expected %d, got %d", r.id, m.From, prevLogIndex, prevLogTerm, term)
+		r.sendAppendResponse(m.From, lastIndex, true)
+		return
+	}
+
+	// 处理日志条目
+	startIndex := prevLogIndex + 1
+	for i, entry := range m.Entries {
+		entryIndex := startIndex + uint64(i)
+		if entryIndex <= r.RaftLog.LastIndex() {
+			// 如果索引在当前日志范围内，检查是否需要更新
+			if termAtIndex, err := r.RaftLog.Term(entryIndex); err == nil && termAtIndex == entry.Term {
+				continue // 已存在相同的条目，跳过
+			}
+			// 不同，发生冲突，修剪当前日志直到 entryIndex
+			r.RaftLog.truncateBelow(entryIndex)
+		}
+		// 将新的日志条目追加到日志中
+		r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+	}
+
+	// 如果领导者已经提交了日志条目，跟随者也要跟着一起提交
+	if m.Commit > r.RaftLog.committed {
+		// 是和领导者的 commitIndex 与附加过来的最后一条日志条目索引比较
+		// 跟随者可能有错误的历史日志条目，所以通过领导者实际发送过来的日志索引来确定那些日志被真正地提交了
+		newCommitted := min(m.Commit, prevLogIndex+uint64(len(m.Entries)))
+		log.Debugf("%d updating committed index from %d to %d", r.id, r.RaftLog.committed, newCommitted)
+		r.RaftLog.committed = newCommitted
+	}
+
+	// 发送附加日志条目成功响应
+	r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), false)
 }
 
-// handleAppendEntries handle AppendEntries RPC request
-// handleAppendEntries 处理追加条目 RPC 请求回复。
+// handleAppendResponse 处理追加条目 RPC 请求回复。
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	// Your Code Here (2A).
-	if Debug {
-		fmt.Printf("%x receive appendResponse from %x\n", r.id, m.From)
+	log.Debugf("%d receive appendResponse(%v) from %d", r.id, !m.Reject, m.From)
+
+	// 同步失败，跳转 next 重新同步
+	if m.Reject {
+		log.Debugf("%d received rejected appendResponse from %d. Decreasing Next to %d", r.id, m.From, r.Prs[m.From].Next-1)
+		r.Prs[m.From].Next--
+		r.sendAppend(m.From)
+		return
 	}
 
-	// 如果接收到的节点任期比当前领导者节点的任期大，更新自己的任期，回退到跟随者
-	if m.Term > r.Term {
-		r.becomeFollower(m.Term, m.From)
+	r.Prs[m.From].Match = m.Index
+	r.Prs[m.From].Next = m.Index + 1
+
+	// Raft 永远不会通过计算副本数目的方式去提交一个之前任期内的日志条目
+	// 只有领导人当前任期里的日志条目可以通过计算副本数目的方式被提交
+	logTerm, err := r.RaftLog.Term(m.Index)
+	if err != nil {
+		log.Errorf("%d failed to get term for index %d: %v", r.id, m.Index, err)
+		return
+	}
+
+	// 是当前任期的日志条目，可以通过计算副本数目的方式提交
+	if logTerm == r.Term {
+		// 尝试更新 committed，如果更新了，向所有节点再发一个 Append，用于同步 committed
+		if r.updateCommittedIndex() {
+			log.Debugf("%d committed index updated, sending AppendEntries to all peers", r.id)
+			r.sendAllAppend()
+		}
+	} else {
+		log.Debugf("%d ignoring appendResponse for index %d as log term %d does not match current term %d", r.id, m.Index, logTerm, r.Term)
 	}
 }
 
@@ -619,22 +752,16 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 // handleHeartbeat 处理心跳 RPC 请求。
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
-	if Debug {
-		fmt.Printf("%x receive hearbeat from %x\n", r.id, m.From)
-	}
+	log.Debugf("%d receive hearbeat from %d", r.id, m.From)
 
-	// 检查接收到的任期
+	// 检查接收到的领导者任期是否小于当前任期
 	if m.Term < r.Term {
-		// 返回一个过期的心跳响应
-		r.msgs = append(r.msgs, pb.Message{
-			MsgType: pb.MessageType_MsgHeartbeatResponse,
-			To:      m.From,
-			From:    r.id,
-			Term:    r.Term,
-		})
+		// 发送心跳回复
+		r.sendHeartbeatResponse(m.From)
 		return
 	}
 
+	// 更新当前节点的任期和领导者
 	// 当前节点是跟随者，更新当前任期和领导者，重置选举时间
 	// 当前节点非跟随者，重置状态，成为跟随者
 	if r.State == StateFollower {
@@ -645,22 +772,15 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 	}
 
-	// 发送心跳响应
-	r.msgs = append(r.msgs, pb.Message{
-		MsgType: pb.MessageType_MsgHeartbeatResponse,
-		To:      m.From,
-		From:    r.id,
-		Term:    r.Term,
-	})
+	// 发送心跳回复
+	r.sendHeartbeatResponse(m.From)
 }
 
 // handleHeartbeatResponse handle Heartbeat RPC request
 // handleHeartbeatResponse 处理心跳 RPC 请求回复。
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Your Code Here (2A).
-	if Debug {
-		fmt.Printf("%x receive heartbeatResponse from %x\n", r.id, m.From)
-	}
+	log.Debugf("%d receive heartbeatResponse from %d", r.id, m.From)
 
 	// 检查接收到的任期
 	if m.Term > r.Term {
@@ -673,14 +793,23 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 		// 记录该节点对心跳响应作出了回复
 		r.heartbeatResp[m.From] = true
 	}
+
+	// 收到心跳回复后，如果发现该节点日志条目过期，发起日志条目同步请求
+	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
+		r.sendAppend(m.From)
+	}
 }
 
 // handleRequestVote handle RequestVote RPC request
 // handleRequestVote 处理请求投票 RPC 请求。
 func (r *Raft) handleRequestVote(m pb.Message) {
+	log.Debugf("%d received vote request from %d for term %d", r.id, m.From, m.Term)
+
 	// 检查接收到的任期
 	if m.Term < r.Term {
 		// 该选举投票请求已经过期，拒绝投票
+		// 该选举投票请求已经过期，拒绝投票
+		log.Debugf("Rejecting vote request from %d: term %d is outdated (current term: %d)", m.From, m.Term, r.Term)
 		r.sendRequestVoteResponse(m.From, true)
 		return
 	}
@@ -689,18 +818,28 @@ func (r *Raft) handleRequestVote(m pb.Message) {
 	if m.Term > r.Term {
 		// 更新任期，重置选票
 		// 当前任期可能还没有选出领导者，设置为 None
+		log.Debugf("Updating current term to %d and becoming follower", m.Term)
 		r.becomeFollower(m.Term, None)
 	}
 
 	// 在相同的任期内，已经投给了其他节点，拒绝投票
 	if r.Vote != None && r.Vote != m.From {
+		log.Debugf("Rejecting vote request from %d: already voted for %d in current term", m.From, r.Vote)
 		r.sendRequestVoteResponse(m.From, true)
 		return
 	}
 
-	// 投票给这个节点
-	r.Vote = m.From
-	r.sendRequestVoteResponse(m.From, false)
+	// 选举限制
+	// 检查候选人的日志是否与自己一样或者更新
+	// 如果两份日志最后的条目的任期号不同，那么任期号大的日志更加新。如果两份日志最后的条目任期号相同，那么日志比较长的那个就更加新
+	if r.RaftLog.isLogUpToDate(m.LogTerm, m.Index) {
+		// 如果是，投票给这个节点
+		r.Vote = m.From
+		r.sendRequestVoteResponse(m.From, false)
+	} else {
+		// 日志不够新，拒绝投票
+		r.sendRequestVoteResponse(m.From, true)
+	}
 }
 
 // handleRequestVoteResponse handle RequestVote RPC response
@@ -711,16 +850,64 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 
 	// 统计赞成票和反对票
 	approvedVotes := 0
+	rejectedVotes := 0
+
 	for _, hasApproved := range r.votes {
 		if hasApproved {
 			approvedVotes++
+		} else {
+			rejectedVotes++
 		}
 	}
 
-	// 判断是否可以成为领导者
+	// 判断是否可以成为领导者或者跟随者
 	totalNodes := len(r.Prs)
 	if approvedVotes > totalNodes/2 {
+		// 赞成票超过半数成为领导者
 		r.becomeLeader()
+	} else if rejectedVotes > totalNodes/2 {
+		// 反对票超过半数成为跟随者，说明当前候选者的任期过旧，在新的任期已经发生了新的选举
+		r.becomeFollower(m.Term, m.From)
+	}
+}
+
+// appendEntry 追加日志条目到 Raft 日志中
+func (r *Raft) appendEntry(entries []*pb.Entry) {
+	// 如果没有条目，则不执行任何操作
+	if len(entries) == 0 {
+		return
+	}
+
+	// 获取当前最后的索引
+	lastIndex := r.RaftLog.LastIndex()
+
+	// 为每个条目设置任期和索引，并追加到日志中
+	for i := range entries {
+		entries[i].Term = r.Term
+		entries[i].Index = lastIndex + 1 + uint64(i)
+		r.RaftLog.entries = append(r.RaftLog.entries, *entries[i])
+	}
+
+	// 更新匹配索引和下一个索引
+	r.Prs[r.id].Match = r.RaftLog.LastIndex()
+	r.Prs[r.id].Next = r.Prs[r.id].Match + 1
+}
+
+// handlePropose 处理客户端提议的日志条目
+func (r *Raft) handlePropose(m pb.Message) {
+	log.Debugf("%d receive propose from %d: %v", r.id, m.From, m.Entries)
+
+	// 追加日志条目
+	r.appendEntry(m.Entries)
+
+	// 集群只有单个节点时不会发送附加日志请求，领导者直接更新日志
+	if len(r.Prs) == 1 {
+		r.RaftLog.stabled++
+		r.RaftLog.committed++
+		// r.RaftLog.applied 不知道什么时候应用到状态机
+	} else {
+		// 发送 AppendEntries RPC 给所有其他节点
+		r.sendAllAppend()
 	}
 }
 
@@ -728,6 +915,53 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 // handleSnapshot 处理快照 RPC 请求。
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+}
+
+// updateCommittedIndex 更新 committedIndex
+func (r *Raft) updateCommittedIndex() bool {
+	var N uint64 = 0
+
+	totalNodes := len(r.Prs)
+	// 特殊处理两个节点的情况（一个节点直接更新）
+	if totalNodes == 2 {
+		var minMatch uint64 = math.MaxUint64
+		for _, process := range r.Prs {
+			minMatch = min(minMatch, process.Match)
+		}
+		N = minMatch
+	} else {
+		// 三个及以上节点
+		currentTerm := r.Term            // 缓存 currentTerm，减少结构体字段访问
+		majority := (totalNodes + 1) / 2 // 定义达到大多数所需的数量
+
+		matchCounts := make(map[uint64]int)
+		// 收集所有跟随者的匹配索引并统计频次
+		for _, process := range r.Prs {
+			matchCounts[process.Match]++
+		}
+
+		// 找到大多数的匹配索引
+		for matchIndex, count := range matchCounts {
+			if count >= majority {
+				logTerm, err := r.RaftLog.Term(matchIndex)
+				// 仅在满足条件时更新，且 N 尽可能大
+				if err == nil && logTerm == currentTerm && matchIndex > N {
+					N = matchIndex
+				}
+			}
+		}
+	}
+
+	// 更新 commitIndex 仅当 N 更大
+	if N > r.RaftLog.committed {
+		log.Debugf("%d updating committed index from %d to %d", r.id, r.RaftLog.committed, N)
+		r.RaftLog.committed = N
+		return true
+	}
+
+	log.Debugf("%d no update to committed index, current: %d, candidate N: %d", r.id, r.RaftLog.committed, N)
+
+	return false
 }
 
 // addNode add a new node to raft group

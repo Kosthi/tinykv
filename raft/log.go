@@ -14,7 +14,10 @@
 
 package raft
 
-import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+import (
+	"github.com/pingcap-incubator/tinykv/log"
+	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+)
 
 // RaftLog manage the log entries, its struct look like:
 //
@@ -46,7 +49,8 @@ type RaftLog struct {
 	// log entries with index <= stabled are persisted to storage.
 	// It is used to record the logs that are not persisted by storage yet.
 	// Everytime handling `Ready`, the unstabled logs will be included.
-	// stabled 表示所有已写入持久化存储的日志条目的索引。这意味着所有索引小于或等于 stabled 的日志条目已经安全存储，并可以在故障恢复后使用。
+	// stabled 表示所有已被多数节点复制，但是未写入持久化存储的日志条目的最小的索引。
+	// 这意味着所有索引小于或等于 stabled 的日志条目已经安全存储，并可以在故障恢复后使用。
 	// 每次处理 `Ready` 时，未稳定的日志条目将被包含在内。
 	stabled uint64
 
@@ -67,7 +71,39 @@ type RaftLog struct {
 // newLog 返回使用给定存储的日志。它恢复日志到刚刚提交的状态，并应用最新的快照。
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
-	return nil
+	// 从存储中获取持久化状态和配置状态
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	firstIndex, err := storage.FirstIndex()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	lastIndex, err := storage.LastIndex()
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// 从存储加载条目，直到已提交的索引
+	entries, err := storage.Entries(firstIndex, lastIndex+1)
+	if err != nil {
+		panic(err.Error())
+	}
+
+	// 创建新的 RaftLog 实例
+	raftLog := &RaftLog{
+		storage:         storage,
+		committed:       hardState.Commit,
+		applied:         firstIndex - 1,
+		stabled:         lastIndex,
+		entries:         entries,
+		pendingSnapshot: nil,
+	}
+
+	return raftLog
 }
 
 // We need to compact the log entries in some point of time like
@@ -86,33 +122,93 @@ func (l *RaftLog) maybeCompact() {
 // 注意，这是你需要实现的测试函数之一。
 func (l *RaftLog) allEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries
 }
 
 // unstableEntries return all the unstable entries
 // unstableEntries 返回所有不稳定的条目。
 func (l *RaftLog) unstableEntries() []pb.Entry {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.stabled:]
 }
 
 // nextEnts returns all the committed but not applied entries
 // nextEnts 返回所有已提交但未应用的条目。
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return nil
+	return l.entries[l.applied:l.committed]
+}
+
+// FirstIndex 返回日志条目的第一个索引。
+func (l *RaftLog) FirstIndex() uint64 {
+	// Your Code Here (2A).
+	return l.entries[0].Index
 }
 
 // LastIndex return the last index of the log entries
 // LastIndex 返回日志条目的最后索引。
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	return 0
+	var length = len(l.entries)
+	if length == 0 {
+		lastIndex, err := l.storage.LastIndex()
+		if err != nil {
+			panic(err.Error())
+		}
+		return lastIndex
+	}
+	return l.entries[length-1].Index
 }
 
 // Term return the term of the entry in the given index
 // Term 返回给定索引处条目的任期。
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	return 0, nil
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		lastIndex := l.LastIndex()
+		if i >= firstIndex && i <= lastIndex {
+			return l.entries[i-firstIndex].Term, nil
+		}
+	}
+	term, err := l.storage.Term(i)
+	if err != nil {
+		return 0, err
+	}
+	return term, nil
+}
+
+// truncateBelow 将当前日志修剪到指定索引（不包括该索引）。
+func (l *RaftLog) truncateBelow(index uint64) {
+	// 确保索引在当前日志范围内
+	firstIndex := l.FirstIndex()
+	if index >= firstIndex && index <= l.LastIndex() {
+		l.entries = l.entries[:index-firstIndex]     // 截取到 index-firstIndex
+		l.stabled = min(l.stabled, index-firstIndex) // 更新稳定的日志索引
+	}
+}
+
+// isLogUpToDate 检查指定的日志条目是否为最新
+func (l *RaftLog) isLogUpToDate(candidateLastLogTerm, candidateLastLogIndex uint64) bool {
+	// 获取当前节点最后一个条目的索引和任期
+	lastIndex := l.LastIndex()
+	term, err := l.Term(lastIndex)
+	if err != nil {
+		log.Errorf("Failed to get term for last index %d: %v", lastIndex, err)
+		return false
+	}
+
+	// 如果候选人的日志任期更高，或者任期相同但索引更高，返回 true
+	if candidateLastLogTerm > term {
+		log.Debugf("Candidate's log is newer (term: %d > current term: %d)", candidateLastLogTerm, term)
+		return true
+	} else if candidateLastLogTerm == term && candidateLastLogIndex >= lastIndex {
+		log.Debugf("Candidate's log is as new (term: %d == current term: %d) and has index (index: %d >= current index: %d)",
+			candidateLastLogTerm, term, candidateLastLogIndex, lastIndex)
+		return true
+	}
+
+	log.Debugf("Current log is up to date. Candidate's log is not newer: (candidateTerm: %d, candidateIndex: %d) <= (currentTerm: %d, currentIndex: %d)",
+		candidateLastLogTerm, candidateLastLogIndex, term, lastIndex)
+	return false
 }
