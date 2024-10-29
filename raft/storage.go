@@ -177,7 +177,7 @@ func (ms *MemoryStorage) Term(i uint64) (uint64, error) {
 		return 0, ErrCompacted
 	}
 	// 如果 i 超过了当前存储中的条目数量，即 i 的值对应的条目不存在
-	if int(i-offset) >= len(ms.ents) {
+	if i-offset >= uint64(len(ms.ents)) {
 		return 0, ErrUnavailable
 	}
 	// 索引有效，返回该条目的任期
