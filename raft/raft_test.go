@@ -1129,6 +1129,70 @@ func TestLeaderIncreaseNext2AB(t *testing.T) {
 	}
 }
 
+// 测试过期的领导者节点尝试发送心跳和附加日志条目的请求是否会被正确拒绝，并且更新任期，回退为跟随者
+func TestOldLeaderAppend2AB(t *testing.T) {
+	msgsType := []pb.MessageType{pb.MessageType_MsgHeartbeat, pb.MessageType_MsgAppend}
+
+	for _, msgType := range msgsType {
+		sm1 := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+		sm2 := newTestRaft(2, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+		sm3 := newTestRaft(3, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+		nt := newNetwork(sm1, sm2, sm3)
+		nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
+		nt.isolate(1)
+		// propose log to old leader should fail
+		// 向旧的领导者提议日志应该失败
+		// 领导者节点 1 被孤立，虽然自己附加日志成功，但是其他节点收不到请求，不会更新提交索引
+		nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
+		if sm1.RaftLog.committed > 1 {
+			t.Fatalf("unexpected commit: %d", sm1.RaftLog.committed)
+		}
+		// propose log to cluster should success
+		// 向集群提议日志应该成功
+		// 节点 2 成为领导者，向节点 3 同步日志并成功提交
+		nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
+		nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
+		wCommit := uint64(3) // 两次选举加一次提议
+		if sm2.RaftLog.committed != wCommit {
+			t.Fatalf("expected sm2 commit: %d, got: %d", wCommit, sm2.RaftLog.committed)
+		}
+		if sm3.RaftLog.committed != wCommit {
+			t.Fatalf("expected sm3 commit: %d, got: %d", wCommit, sm3.RaftLog.committed)
+		}
+
+		// 恢复网络分区
+		nt.recover()
+
+		// 在当前领导者节点 2 的心跳还未到来前，过期的领导者节点 1 尝试向节点 2 发起附加日志或心跳请求，
+		// 节点 1 应该认识到自己过期，然后成为跟随者，但是还不知道领导者是谁，因为可能是一个跟随者收到的
+		nt.send(pb.Message{From: 1, To: 2, Term: sm1.Term, MsgType: msgType})
+		if sm1.State != StateFollower {
+			t.Fatalf("state = %s, want StateFollower", sm1.State)
+		}
+		if sm1.Term != sm2.Term {
+			t.Fatalf("term = %d, want %d", sm1.Term, sm2.Term)
+		}
+		if sm1.Lead != None {
+			t.Fatalf("lead = %d, want None", sm1.Lead)
+		}
+		// 因为附加日志条目请求被拒绝，节点 1 不会更新提交索引
+		if sm1.RaftLog.committed > 1 {
+			t.Fatalf("expected sm1 commit: 1, got: %d", sm1.RaftLog.committed)
+		}
+
+		// 领导者节点 2 发起心跳，同步其他节点日志并提交
+		nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgBeat})
+		// 节点 1 现在知道自己的领导者是节点 2
+		if sm1.Lead != sm2.id {
+			t.Fatalf("lead = %d, want %d", sm1.Lead, sm2.id)
+		}
+		// 节点 1 同步了日志并提交
+		if sm1.RaftLog.committed != wCommit {
+			t.Fatalf("expected sm1 commit: %d, got: %d", wCommit, sm1.RaftLog.committed)
+		}
+	}
+}
+
 func TestRestoreSnapshot2C(t *testing.T) {
 	s := pb.Snapshot{
 		Metadata: &pb.SnapshotMetadata{
