@@ -22,8 +22,6 @@ import (
 	"math/rand"
 )
 
-const Debug = true
-
 // None is a placeholder node ID used when there is no leader.
 // None 是当没有领导者时使用的占位符节点 ID。
 const None uint64 = 0
@@ -407,13 +405,11 @@ func (r *Raft) sendRequestVoteResponse(to uint64, reject bool) {
 	}
 	r.msgs = append(r.msgs, msg)
 
-	if Debug {
-		responseType := "granted"
-		if reject {
-			responseType = "rejected"
-		}
-		log.Debugf("%d send requestVoteResponse(%s) to %d at term %d", r.id, responseType, to, r.Term)
+	responseType := "granted"
+	if reject {
+		responseType = "rejected"
 	}
+	log.Debugf("%d send requestVoteResponse(%s) to %d at term %d", r.id, responseType, to, r.Term)
 }
 
 // tick advances the internal logical clock by a single tick.
