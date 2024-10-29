@@ -449,12 +449,15 @@ func TestLeaderStartReplication2AB(t *testing.T) {
 	commitNoopEntry(r, s)
 	li := r.RaftLog.LastIndex()
 
+	// 处理客户端提议的日志条目
 	ents := []*pb.Entry{{Data: []byte("some data")}}
 	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: ents})
 
+	// 日志中两个日志，一个 no-op，一个 'some data'
 	if g := r.RaftLog.LastIndex(); g != li+1 {
 		t.Errorf("lastIndex = %d, want %d", g, li+1)
 	}
+	// 'some data' 还没提交，因为还没附加条目给大多数节点
 	if g := r.RaftLog.committed; g != li {
 		t.Errorf("committed = %d, want %d", g, li)
 	}
@@ -491,22 +494,28 @@ func TestLeaderCommitEntry2AB(t *testing.T) {
 	r.becomeLeader()
 	commitNoopEntry(r, s)
 	li := r.RaftLog.LastIndex()
-	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
 
+	// 模拟客户端提议领导者向其他节点发生附加条目请求，其他节点作出处理并回复
+	r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
+	// 领导者在大多数节点完成日志同步时更新 commited，并向所有节点再发一个 Append，用于同步 committed
 	for _, m := range r.readMessages() {
 		r.Step(acceptAndReply(m))
 	}
 
+	// no-op 和 'some data' 两条日志已经提交
 	if g := r.RaftLog.committed; g != li+1 {
 		t.Errorf("committed = %d, want %d", g, li+1)
 	}
 	wents := []pb.Entry{{Index: li + 1, Term: 1, Data: []byte("some data")}}
+	// 'some data' 还没应用到状态机
 	if g := r.RaftLog.nextEnts(); !reflect.DeepEqual(g, wents) {
 		t.Errorf("nextEnts = %+v, want %+v", g, wents)
 	}
 	msgs := r.readMessages()
 	sort.Sort(messageSlice(msgs))
+	// commited 更新后会再发起附加条目请求，来同步 commited
 	for i, m := range msgs {
+		// 节点 2、3
 		if w := uint64(i + 2); m.To != w {
 			t.Errorf("to = %d, want %d", m.To, w)
 		}
@@ -522,12 +531,15 @@ func TestLeaderCommitEntry2AB(t *testing.T) {
 // TestLeaderAcknowledgeCommit tests that a log entry is committed once the
 // leader that created the entry has replicated it on a majority of the servers.
 // Reference: section 5.3
+// TestLeaderAcknowledgeCommit 测试日志条目在创建该条目的领导者在大多数服务器上复制它后是否被提交。
+// 参考文献：第 5.3 节
 func TestLeaderAcknowledgeCommit2AB(t *testing.T) {
 	tests := []struct {
 		size      int
 		acceptors map[uint64]bool
 		wack      bool
 	}{
+		// 大多数节点完成附加条目后即可提交
 		{1, nil, true},
 		{3, nil, false},
 		{3, map[uint64]bool{2: true}, true},
@@ -564,8 +576,12 @@ func TestLeaderAcknowledgeCommit2AB(t *testing.T) {
 // entries created by previous leaders.
 // Also, it applies the entry to its local state machine (in log order).
 // Reference: section 5.3
+// TestLeaderCommitPrecedingEntries 测试领导者在提交日志条目时，是否同时提交领导者日志中的所有先前条目，包括由前任领导者创建的条目。
+// 此外，它还将条目按日志顺序应用于其本地状态机。
+// 参考文献：第 5.3 节
 func TestLeaderCommitPrecedingEntries2AB(t *testing.T) {
 	tests := [][]pb.Entry{
+		// 存储中的先前条目，在提交时要一起提交
 		{},
 		{{Term: 2, Index: 1}},
 		{{Term: 1, Index: 1}, {Term: 2, Index: 2}},
@@ -573,7 +589,9 @@ func TestLeaderCommitPrecedingEntries2AB(t *testing.T) {
 	}
 	for i, tt := range tests {
 		storage := NewMemoryStorage()
+		// 持久化日志进存储中
 		storage.Append(tt)
+		// 日志初始化过程会从存储中读取日志
 		r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, storage)
 		r.Term = 2
 		r.becomeCandidate()
@@ -595,7 +613,11 @@ func TestLeaderCommitPrecedingEntries2AB(t *testing.T) {
 // TestFollowerCommitEntry tests that once a follower learns that a log entry
 // is committed, it applies the entry to its local state machine (in log order).
 // Reference: section 5.3
+// TestFollowerCommitEntry 测试一旦追随者得知一个日志条目已被提交，它是否将该条目按日志顺序应用于其本地状态机。
+// 参考文献：第 5.3 节
 func TestFollowerCommitEntry2AB(t *testing.T) {
+	// 如果领导者已经提交了日志条目，跟随者也要跟着一起提交
+	// 也就是跟随者要跟领导者同步已经提交的日志条目
 	tests := []struct {
 		ents   []*pb.Entry
 		commit uint64
@@ -652,6 +674,9 @@ func TestFollowerCommitEntry2AB(t *testing.T) {
 // then it refuses the new entries. Otherwise it replies that it accepts the
 // append entries.
 // Reference: section 5.3
+// TestFollowerCheckMessageType_MsgAppend 测试如果追随者在其日志中未找到与 AppendEntries RPC 中的索引和任期相同的条目，则它会拒绝新的条目。
+// 否则，它会回复接受追加条目。
+// 参考文献：第 5.3 节
 func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 	ents := []pb.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}}
 	tests := []struct {
@@ -660,14 +685,18 @@ func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 		wreject bool
 	}{
 		// match with committed entries
+		// 与已提交条目匹配
 		{0, 0, false},
 		{ents[0].Term, ents[0].Index, false},
 		// match with uncommitted entries
+		// 与未提交条目匹配
 		{ents[1].Term, ents[1].Index, false},
 
 		// unmatch with existing entry
+		// 与现有条目不匹配
 		{ents[0].Term, ents[1].Index, true},
 		// unexisting entry
+		// 不存在的条目
 		{ents[1].Term + 1, ents[1].Index + 1, true},
 	}
 	for i, tt := range tests {
@@ -678,6 +707,7 @@ func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 		r.becomeFollower(2, 2)
 		msgs := r.readMessages() // clear message
 
+		// 实际上这里并没有数据被附加，只是做了索引和任期的检查
 		r.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: tt.term, Index: tt.index})
 
 		msgs = r.readMessages()
@@ -698,6 +728,9 @@ func TestFollowerCheckMessageType_MsgAppend2AB(t *testing.T) {
 // and append any new entries not already in the log.
 // Also, it writes the new entry into stable storage.
 // Reference: section 5.3
+// TestFollowerAppendEntries 测试当 AppendEntries RPC 有效时，追随者将删除现有的冲突条目及其后面的所有条目，
+// 并附加任何尚不存在于日志中的新条目。此外，它还将新条目写入稳定存储。
+// 参考文献：第 5.3 节
 func TestFollowerAppendEntries2AB(t *testing.T) {
 	tests := []struct {
 		index, term uint64
@@ -707,14 +740,14 @@ func TestFollowerAppendEntries2AB(t *testing.T) {
 		wunstable   []*pb.Entry
 	}{
 		{
-			2, 2, 3,
-			[]*pb.Entry{{Term: 3, Index: 3}},
-			[]*pb.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}, {Term: 3, Index: 3}},
-			[]*pb.Entry{{Term: 3, Index: 3}},
+			2, 2, 3, // 附加条目请求的prevIndex，prevTerm，leaderTerm
+			[]*pb.Entry{{Term: 3, Index: 3}},                                           // 附加条目请求的日志条目
+			[]*pb.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}, {Term: 3, Index: 3}}, // 期望节点附加条目后的日志内容
+			[]*pb.Entry{{Term: 3, Index: 3}},                                           // 附加到了这个节点，但未附加到大多数节点的不稳定的条目
 		},
 		{
 			1, 1, 4,
-			[]*pb.Entry{{Term: 3, Index: 2}, {Term: 4, Index: 3}},
+			[]*pb.Entry{{Term: 3, Index: 2}, {Term: 4, Index: 3}}, // 检测到冲突会删除该日志条目及以后的日志条目
 			[]*pb.Entry{{Term: 1, Index: 1}, {Term: 3, Index: 2}, {Term: 4, Index: 3}},
 			[]*pb.Entry{{Term: 3, Index: 2}, {Term: 4, Index: 3}},
 		},
@@ -762,7 +795,10 @@ func TestFollowerAppendEntries2AB(t *testing.T) {
 // TestLeaderSyncFollowerLog tests that the leader could bring a follower's log
 // into consistency with its own.
 // Reference: section 5.3, figure 7
+// TestLeaderSyncFollowerLog 测试领导者是否能够使跟随者的日志与其自身保持一致。
+// 参考：第 5.3 节，图 7
 func TestLeaderSyncFollowerLog2AB(t *testing.T) {
+	// 领导者节点 1 的日志条目
 	ents := []pb.Entry{
 		{},
 		{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3},
@@ -772,6 +808,7 @@ func TestLeaderSyncFollowerLog2AB(t *testing.T) {
 	}
 	term := uint64(8)
 	tests := [][]pb.Entry{
+		// 跟随者节点 2 的日志条目，冲突的会发生截断，最后跟随者的日志条目会与领导者完全一致
 		{
 			{},
 			{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3},
@@ -824,12 +861,18 @@ func TestLeaderSyncFollowerLog2AB(t *testing.T) {
 		// It is necessary to have a three-node cluster.
 		// The second may have more up-to-date log than the first one, so the
 		// first node needs the vote from the third node to become the leader.
+		// 必须有一个三节点集群。
+		// 第二个节点的日志可能比第一个节点更新，因此第一个节点需要来自第三个节点的投票才能成为领导者。
 		n := newNetwork(lead, follower, nopStepper)
+		// 领导者发起选举请求
 		n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		// The election occurs in the term after the one we loaded with
 		// lead's term and committed index setted up above.
+		// 选举发生在我们用领导者的任期和上述设置的已提交索引加载的任期之后。
+		// 节点 3 返回赞成票，节点 1 被选举为领导者（如果已经是领导者则会忽略这条消息）向其他节点发起 no-op 附加条目请求，用于其他节点日志同步
 		n.send(pb.Message{From: 3, To: 1, MsgType: pb.MessageType_MsgRequestVoteResponse, Term: term + 1})
 
+		// 领导者节点 1 收到客户端数据，向其他节点发起附加条目请求
 		n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 
 		if g := diffu(ltoa(lead.RaftLog), ltoa(follower.RaftLog)); g != "" {
@@ -841,6 +884,9 @@ func TestLeaderSyncFollowerLog2AB(t *testing.T) {
 // TestVoteRequest tests that the vote request includes information about the candidate’s log
 // and are sent to all of the other nodes.
 // Reference: section 5.4.1
+// TestVoteRequest 测试投票请求是否包含候选人日志的信息
+// 并且是否发送到所有其他节点。
+// 参考文献：第 5.4.1 节
 func TestVoteRequest2AB(t *testing.T) {
 	tests := []struct {
 		ents  []*pb.Entry
@@ -851,6 +897,7 @@ func TestVoteRequest2AB(t *testing.T) {
 	}
 	for j, tt := range tests {
 		r := newTestRaft(1, []uint64{1, 2, 3}, 10, 1, NewMemoryStorage())
+		// 向这个跟随者节点附加日志条目
 		r.Step(pb.Message{
 			From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: tt.wterm - 1, LogTerm: 0, Index: 0, Entries: tt.ents,
 		})
@@ -875,6 +922,7 @@ func TestVoteRequest2AB(t *testing.T) {
 			if m.Term != tt.wterm {
 				t.Errorf("#%d: term = %d, want %d", i, m.Term, tt.wterm)
 			}
+			// 检查投票请求中是否包含了候选人最后一个日志条目的索引和任期
 			windex, wlogterm := tt.ents[len(tt.ents)-1].Index, tt.ents[len(tt.ents)-1].Term
 			if m.Index != windex {
 				t.Errorf("#%d: index = %d, want %d", i, m.Index, windex)
@@ -889,23 +937,29 @@ func TestVoteRequest2AB(t *testing.T) {
 // TestVoter tests the voter denies its vote if its own log is more up-to-date
 // than that of the candidate.
 // Reference: section 5.4.1
+// TestVoter 测试投票者在其自己的日志比候选者的日志更新时拒绝投票
+// 参考文献：第 5.4.1 节
 func TestVoter2AB(t *testing.T) {
 	tests := []struct {
-		ents    []pb.Entry
-		logterm uint64
-		index   uint64
+		ents    []pb.Entry // 投票者节点 1 的日志条目
+		logterm uint64     // 请求投票的候选人节点 2 的日志任期
+		index   uint64     // 请求投票的候选人节点 2 的日志索引
 
-		wreject bool
+		wreject bool // 投票者是否拒绝这次投票请求
 	}{
+		// 看两者的最后一个日志条目，先比任期，再比索引，谁大谁更新
 		// same logterm
+		// 一样的日志任期
 		{[]pb.Entry{{Term: 1, Index: 1}}, 1, 1, false},
 		{[]pb.Entry{{Term: 1, Index: 1}}, 1, 2, false},
 		{[]pb.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}}, 1, 1, true},
 		// candidate higher logterm
+		// 候选者有更高的任期
 		{[]pb.Entry{{Term: 1, Index: 1}}, 2, 1, false},
 		{[]pb.Entry{{Term: 1, Index: 1}}, 2, 2, false},
 		{[]pb.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}}, 2, 1, false},
 		// voter higher logterm
+		// 投票者有更高的日志任期
 		{[]pb.Entry{{Term: 2, Index: 1}}, 1, 1, true},
 		{[]pb.Entry{{Term: 2, Index: 1}}, 1, 2, true},
 		{[]pb.Entry{{Term: 2, Index: 1}, {Term: 1, Index: 2}}, 1, 1, true},
@@ -934,16 +988,20 @@ func TestVoter2AB(t *testing.T) {
 // TestLeaderOnlyCommitsLogFromCurrentTerm tests that only log entries from the leader’s
 // current term are committed by counting replicas.
 // Reference: section 5.4.2
+// TestLeaderOnlyCommitsLogFromCurrentTerm 测试只有来自领导者当前任期的日志条目会被提交，通过计数副本来验证。
+// 参考文献：第 5.4.2 节
 func TestLeaderOnlyCommitsLogFromCurrentTerm2AB(t *testing.T) {
 	ents := []pb.Entry{{Term: 1, Index: 1}, {Term: 2, Index: 2}}
 	tests := []struct {
-		index   uint64
-		wcommit uint64
+		index   uint64 // 之前或当前任期对应的索引
+		wcommit uint64 // 是否应该提交
 	}{
 		// do not commit log entries in previous terms
+		// 不要提交前一个任期的日志条目
 		{1, 0},
 		{2, 0},
 		// commit log in current term
+		// 提交当前任期的日志条目
 		{3, 3},
 	}
 	for i, tt := range tests {
@@ -952,10 +1010,12 @@ func TestLeaderOnlyCommitsLogFromCurrentTerm2AB(t *testing.T) {
 		r := newTestRaft(1, []uint64{1, 2}, 10, 1, storage)
 		r.Term = 2
 		// become leader at term 3
+		// 在第 3 任期成为领导者
 		r.becomeCandidate()
 		r.becomeLeader()
 		r.readMessages()
 		// propose a entry to current term
+		// 向当前任期提议一个条目
 		r.Step(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 
 		r.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppendResponse, Term: r.Term, Index: tt.index})
@@ -971,18 +1031,23 @@ func (s messageSlice) Len() int           { return len(s) }
 func (s messageSlice) Less(i, j int) bool { return fmt.Sprint(s[i]) < fmt.Sprint(s[j]) }
 func (s messageSlice) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
+// 确保领导者能够发送一个空操作条目，并确保所有跟随者能够正确处理和更新他们的日志状态。
+// 它们在 Raft 算法中是非常重要的，因为它们用于保持领导者与跟随者之间的一致性和同步性。
+// 通过提交 no-op 条目，领导者可以安全地推进其任期和日志，而不引入新的实际数据，同时也为其他节点提供一致的视图。
 func commitNoopEntry(r *Raft, s *MemoryStorage) {
+	// 检查领导者状态，只有领导者能提交空条目
 	if r.State != StateLeader {
 		panic("it should only be used when it is the leader")
 	}
+	// 发送 AppendEntries
 	for id := range r.Prs {
 		if id == r.id {
 			continue
 		}
-
 		r.sendAppend(id)
 	}
 	// simulate the response of MessageType_MsgAppend
+	// 模拟 MessageType_MsgAppend 类型消息的响应
 	msgs := r.readMessages()
 	for _, m := range msgs {
 		if m.MsgType != pb.MessageType_MsgAppend || len(m.Entries) != 1 || m.Entries[0].Data != nil {
@@ -991,9 +1056,13 @@ func commitNoopEntry(r *Raft, s *MemoryStorage) {
 		r.Step(acceptAndReply(m))
 	}
 	// ignore further messages to refresh followers' commit index
+	// 忽略进一步的消息以刷新跟随者的提交索引
 	r.readMessages()
+	// 还未持久化到稳定存储的条目）追加到存储中
 	s.Append(r.RaftLog.unstableEntries())
+	// 设置状态机应用的索引 applied 为当前提交的索引，因为多数节点都已经提交
 	r.RaftLog.applied = r.RaftLog.committed
+	// 设置稳定的索引 (stabled) 更新为当前日志的最后一个索引
 	r.RaftLog.stabled = r.RaftLog.LastIndex()
 }
 
@@ -1002,11 +1071,12 @@ func acceptAndReply(m pb.Message) pb.Message {
 		panic("type should be MessageType_MsgAppend")
 	}
 	// Note: reply message don't contain LogTerm
+	// 注意：回复消息不包含 LogTerm
 	return pb.Message{
 		From:    m.To,
 		To:      m.From,
 		Term:    m.Term,
 		MsgType: pb.MessageType_MsgAppendResponse,
-		Index:   m.Index + uint64(len(m.Entries)),
+		Index:   m.Index + uint64(len(m.Entries)), // 将当前的索引增加已包含的条目数，以表示成功的追加
 	}
 }

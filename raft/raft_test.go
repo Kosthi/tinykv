@@ -25,6 +25,7 @@ import (
 )
 
 // returns a new MemoryStorage with only ents filled
+// 返回一个新的 MemoryStorage 实例，且只填写了 ents
 func newMemoryStorageWithEnts(ents []pb.Entry) *MemoryStorage {
 	return &MemoryStorage{
 		ents:     ents,
@@ -33,8 +34,10 @@ func newMemoryStorageWithEnts(ents []pb.Entry) *MemoryStorage {
 }
 
 // nextEnts returns the appliable entries and updates the applied index
+// nextEnts 返回可以应用的日志条目，并更新已应用的索引
 func nextEnts(r *Raft, s *MemoryStorage) (ents []pb.Entry) {
 	// Transfer all unstable entries to "stable" storage.
+	// 将所有不稳定的条目转移到“稳定”存储中
 	s.Append(r.RaftLog.unstableEntries())
 	r.RaftLog.stabled = r.RaftLog.LastIndex()
 
@@ -55,12 +58,14 @@ func (r *Raft) readMessages() []pb.Message {
 	return msgs
 }
 
+// 测试领导者是否能正确附加日志条目（包括 no-op 日志条目）
 func TestProgressLeader2AB(t *testing.T) {
 	r := newTestRaft(1, []uint64{1, 2}, 5, 1, NewMemoryStorage())
 	r.becomeCandidate()
 	r.becomeLeader()
 
 	// Send proposals to r1. The first 5 entries should be appended to the log.
+	// 将提议发送给 r1。前 5 个条目应附加到日志中。
 	propMsg := pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("foo")}}}
 	for i := 0; i < 5; i++ {
 		if pr := r.Prs[r.id]; pr.Match != uint64(i+1) || pr.Next != pr.Match+1 {
@@ -130,6 +135,8 @@ func TestLeaderCycle2AA(t *testing.T) {
 // newly-elected leader does *not* have the newest (i.e. highest term)
 // log entries, and must overwrite higher-term log entries with
 // lower-term ones.
+// TestLeaderElectionOverwriteNewerLogs 测试一个场景，其中一位新选出的领导者没有最新的（即，最高任期）日志条目，
+// 并且必须用较低任期的条目覆盖较高任期的日志条目。
 func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	cfg := func(c *Config) {
 		c.peers = idsBySize(5)
@@ -148,16 +155,27 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	// entry overwrites the losers'. (TestLeaderSyncFollowerLog tests
 	// the case where older log entries are overwritten, so this test
 	// focuses on the case where the newer entries are lost).
+	// 该网络代表以下事件序列的结果：
+	// - 节点 1 在任期 1 中赢得了选举。
+	// - 节点 1 将日志条目复制到节点 2，但在发送给其他节点之前死掉了。
+	// - 节点 3 在任期 2 中赢得了第二次选举。
+	// - 节点 3 向其日志写入了一个条目，但在发送给其他节点之前死掉了。
+	//
+	// 此时，节点 1、2 和 3 的日志中都有未提交的条目，并且在任期 3 中可能会赢得选举。
+	// 胜者的日志条目将覆盖失败者的日志条目。(TestLeaderSyncFollowerLog 测试
+	// 旧日志条目被覆盖的情况，因此此测试侧重于较新条目丢失的情况)。
 	n := newNetworkWithConfig(cfg,
-		entsWithConfig(cfg, 1, 1),     // Node 1: Won first election
-		entsWithConfig(cfg, 2, 1),     // Node 2: Got logs from node 1
-		entsWithConfig(cfg, 3, 2),     // Node 3: Won second election
-		votedWithConfig(cfg, 4, 3, 2), // Node 4: Voted but didn't get logs
-		votedWithConfig(cfg, 5, 3, 2)) // Node 5: Voted but didn't get logs
+		entsWithConfig(cfg, 1, 1),     // 节点 1: 赢得第一次选举
+		entsWithConfig(cfg, 2, 1),     // 节点 2: 从节点 1 获取日志
+		entsWithConfig(cfg, 3, 2),     // 节点 3: 赢得第二次选举
+		votedWithConfig(cfg, 4, 3, 2), // 节点 4: 投票但未获取日志（任期为 2，最后一条日志任期为 0）
+		votedWithConfig(cfg, 5, 3, 2)) // 节点 5: 投票但未获取日志（任期为 2，最后一条日志任期为 0）
 
 	// Node 1 campaigns. The election fails because a quorum of nodes
 	// know about the election that already happened at term 2. Node 1's
 	// term is pushed ahead to 2.
+	// 节点 1 发起竞选。由于有法定人数的节点知道在任期 2 中已经发生的选举，因此选举失败。
+	// 节点 1 的任期被推迟到 2。
 	n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	sm1 := n.peers[1].(*Raft)
 	if sm1.State != StateFollower {
@@ -168,6 +186,8 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 	}
 
 	// Node 1 campaigns again with a higher term. This time it succeeds.
+	// 节点 1 再次以更高的任期进行竞选。这次它成功了。
+	// 附加条目请求使得较低任期的条目覆盖了较高任期的日志条目
 	n.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	if sm1.State != StateLeader {
 		t.Errorf("state = %s, want StateLeader", sm1.State)
@@ -178,6 +198,7 @@ func TestLeaderElectionOverwriteNewerLogs2AB(t *testing.T) {
 
 	// Now all nodes agree on a log entry with term 1 at index 1 (and
 	// term 3 at index 2).
+	// 现在所有节点在索引 1 上达成了一个包含任期 1 的日志条目（以及在索引 2 上包含任期 3 的日志条目）。
 	for i := range n.peers {
 		sm := n.peers[i].(*Raft)
 		entries := sm.RaftLog.allEntries()
@@ -263,6 +284,7 @@ func TestVoteFromAnyState2AA(t *testing.T) {
 	}
 }
 
+// 测试集群中每个节点能否正确复制日志并提交
 func TestLogReplication2AB(t *testing.T) {
 	tests := []struct {
 		*network
@@ -288,12 +310,15 @@ func TestLogReplication2AB(t *testing.T) {
 	}
 
 	for i, tt := range tests {
+		// 选举出领导者
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 
+		// 执行测试，处理客户端提议和新的选举
 		for _, m := range tt.msgs {
 			tt.send(m)
 		}
 
+		// 检查集群中每个节点是否都复制了日志并提交了
 		for j, x := range tt.network.peers {
 			sm := x.(*Raft)
 
@@ -322,6 +347,7 @@ func TestLogReplication2AB(t *testing.T) {
 	}
 }
 
+// 测试单节点日志条目提交
 func TestSingleNodeCommit2AB(t *testing.T) {
 	tt := newNetwork(nil)
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
@@ -336,15 +362,19 @@ func TestSingleNodeCommit2AB(t *testing.T) {
 
 // TestCommitWithoutNewTermEntry tests the entries could be committed
 // when leader changes with noop entry and no new proposal comes in.
+// TestCommitWithoutNewTermEntry 测试在领导者变化时，能够提交条目
+// 当没有新的提案到达时，系统可以提交一个 no-op 条目。
 func TestCommitWithoutNewTermEntry2AB(t *testing.T) {
 	tt := newNetwork(nil, nil, nil, nil, nil)
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 
 	// 0 cannot reach 2,3,4
+	// 节点 0 无法到达节点 3、4、5
 	tt.cut(1, 3)
 	tt.cut(1, 4)
 	tt.cut(1, 5)
 
+	// 节点 1 和 2 同步了最新的日志条目
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
 
@@ -354,11 +384,14 @@ func TestCommitWithoutNewTermEntry2AB(t *testing.T) {
 	}
 
 	// network recovery
+	// 网络恢复
 	tt.recover()
 
 	// elect 2 as the new leader with term 2
 	// after append a ChangeTerm entry from the current term, all entries
 	// should be committed
+	// 将节点 2 选举为新的领导者，任期为 2。
+	// 在从当前任期追加一个 ChangeTerm 条目之后，所有条目都应该被提交。
 	tt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
 
 	if sm.RaftLog.committed != 4 {
@@ -369,12 +402,18 @@ func TestCommitWithoutNewTermEntry2AB(t *testing.T) {
 // TestCommitWithHeartbeat tests leader can send log
 // to follower when it received a heartbeat response
 // which indicate it doesn't have update-to-date log
+// TestCommitWithHeartbeat 测试领导者在收到心跳响应后能够
+// 向跟随者发送日志，该响应表明跟随者没有更新到最新的日志。
+// 实际上在收到心跳响应后，领导者检查该跟随者的日志是否落后，落后则发送日志
 func TestCommitWithHeartbeat2AB(t *testing.T) {
 	tt := newNetwork(nil, nil, nil, nil, nil)
+	// 节点 1 成为领导者
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 
 	// isolate node 5
+	// 隔离节点 5
 	tt.isolate(5)
+	// 向节点 2、3、4 同步日志条目
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("some data")}}})
 
@@ -384,9 +423,11 @@ func TestCommitWithHeartbeat2AB(t *testing.T) {
 	}
 
 	// network recovery
+	// 网络恢复
 	tt.recover()
 
 	// leader broadcast heartbeat
+	// 领导者广播心跳
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgBeat})
 
 	if sm.RaftLog.committed != 3 {
@@ -406,12 +447,14 @@ func TestDuelingCandidates2AB(t *testing.T) {
 	nt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgHup})
 
 	// 1 becomes leader since it receives votes from 1 and 2
+	// 1 成为领导者，因为它收到了来自 1 和 2 的投票。
 	sm := nt.peers[1].(*Raft)
 	if sm.State != StateLeader {
 		t.Errorf("state = %s, want %s", sm.State, StateLeader)
 	}
 
 	// 3 stays as candidate since it receives a vote from 3 and a rejection from 2
+	// 3 仍然作为候选者，因为它仅获得了来自 3 的投票，并且收到了来自 2 的拒绝投票。
 	sm = nt.peers[3].(*Raft)
 	if sm.State != StateCandidate {
 		t.Errorf("state = %s, want %s", sm.State, StateCandidate)
@@ -422,6 +465,9 @@ func TestDuelingCandidates2AB(t *testing.T) {
 	// candidate 3 now increases its term and tries to vote again
 	// we expect it to disrupt the leader 1 since it has a higher term
 	// 3 will be follower again since both 1 and 2 rejects its vote request since 3 does not have a long enough log
+	// 候选者 3 现在增加了它的任期并尝试再次投票。
+	// 我们预计它会干扰领导者 1，因为它的任期较高。
+	// 但是，3 将再次成为追随者，因为节点 1 和 2 拒绝了它的投票请求，原因是 3 的日志不够长。
 	nt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgHup})
 
 	wlog := newLog(newMemoryStorageWithEnts([]pb.Entry{{}, {Data: nil, Term: 1, Index: 1}}))
@@ -456,6 +502,7 @@ func TestDuelingCandidates2AB(t *testing.T) {
 	}
 }
 
+// 测试各个节点的日志同步和 committed 能否正确更新
 func TestCandidateConcede2AB(t *testing.T) {
 	tt := newNetwork(nil, nil, nil)
 	tt.isolate(1)
@@ -464,14 +511,18 @@ func TestCandidateConcede2AB(t *testing.T) {
 	tt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgHup})
 
 	// heal the partition
+	// 恢复网络分区
 	tt.recover()
 	// send heartbeat; reset wait
+	// 发送心跳；重置等待时间
 	tt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgBeat})
 
 	data := []byte("force follower")
 	// send a proposal to 3 to flush out a MessageType_MsgAppend to 1
+	// 向 3 发送提议，将 MessageType_MsgAppend 刷新到 1
 	tt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: data}}})
 	// send heartbeat; flush out commit
+	// 发送心跳；处理提交
 	tt.send(pb.Message{From: 3, To: 3, MsgType: pb.MessageType_MsgBeat})
 
 	a := tt.peers[1].(*Raft)
@@ -507,17 +558,22 @@ func TestSingleNodeCandidate2AA(t *testing.T) {
 	}
 }
 
+// 测试来自过期的领导者的附加日志条目请求是否会被正确忽略
 func TestOldMessages2AB(t *testing.T) {
 	tt := newNetwork(nil, nil, nil)
 	// make 0 leader @ term 3
+	// 在第 3 个任期内将节点 1 设为领导者
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	tt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 	// pretend we're an old leader trying to make progress; this entry is expected to be ignored.
+	// 假装我们是一个旧的领导者，试图取得进展；此条目预期会被忽略。
 	tt.send(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgAppend, Term: 2, Entries: []*pb.Entry{{Index: 3, Term: 2}}})
 	// commit a new entry
+	// 提交一个新的条目
 	tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("somedata")}}})
 
+	// 检查日志条目是否被正确复制到各个节点并提交
 	ilog := newLog(
 		newMemoryStorageWithEnts([]pb.Entry{
 			{}, {Data: nil, Term: 1, Index: 1},
@@ -538,6 +594,7 @@ func TestOldMessages2AB(t *testing.T) {
 	}
 }
 
+// 测试客户端提议的日志是否能被领导者正确复制到大多数节点并提交，或者被候选者忽略
 func TestProposal2AB(t *testing.T) {
 	tests := []struct {
 		*network
@@ -554,9 +611,12 @@ func TestProposal2AB(t *testing.T) {
 		data := []byte("somedata")
 
 		// promote 1 to become leader
+		// 将节点 1 提升为领导者，如果大多数节点宕机可能会失败
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
+		// 接收客户端提议提交一个新日志条目
 		tt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: data}}})
 
+		// 如果节点 1 没有拿到足够的选票，依然是候选者，那么会忽略客户端的提议，日志为空，其他节点也是
 		wantLog := newLog(NewMemoryStorage())
 		if tt.success {
 			wantLog = newLog(newMemoryStorageWithEnts([]pb.Entry{{}, {Data: nil, Term: 1, Index: 1}, {Term: 1, Index: 2, Data: data}}))
@@ -583,6 +643,12 @@ func TestProposal2AB(t *testing.T) {
 //  2. If an existing entry conflicts with a new one (same index but different terms),
 //     delete the existing entry and all that follow it; append any new entries not already in the log.
 //  3. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry).
+//
+// TestHandleMessageType_MsgAppend 确保：
+//  1. 如果日志在 prevLogIndex 没有包含一个与 prevLogTerm 匹配的条目，则返回 false。
+//  2. 如果现有条目与新条目冲突（索引相同但任期不同），
+//     则删除现有条目及其后面的所有条目；追加任何未在日志中的新条目。
+//  3. 如果 leaderCommit > commitIndex，设置 commitIndex = min(leaderCommit, 最后一个新条目的索引)。
 func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	tests := []struct {
 		m       pb.Message
@@ -602,6 +668,8 @@ func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 		{pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: 1, Index: 1, Commit: 4, Entries: []*pb.Entry{{Index: 2, Term: 2}}}, 2, 2, false},
 
 		// Ensure 3
+		// 是和领导者的 commitIndex 与附加过来的最后一条日志条目索引比较
+		// 跟随者可能有错误的历史日志条目，所以通过领导者实际发送过来的日志索引来确定那些日志被真正地提交了
 		{pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: 1, Index: 1, Commit: 3}, 2, 1, false},                                            // match entry 1, commit up to last new entry 1
 		{pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: 1, Index: 1, Commit: 3, Entries: []*pb.Entry{{Index: 2, Term: 2}}}, 2, 2, false}, // match entry 1, commit up to last new entry 2
 		{pb.Message{MsgType: pb.MessageType_MsgAppend, Term: 2, LogTerm: 2, Index: 2, Commit: 3}, 2, 2, false},                                            // match entry 2, commit up to last new entry 2
@@ -612,8 +680,9 @@ func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 		storage := NewMemoryStorage()
 		storage.Append([]pb.Entry{{Index: 1, Term: 1}, {Index: 2, Term: 2}})
 		sm := newTestRaft(1, []uint64{1}, 10, 1, storage)
+		// 成为跟随者 任期 2
 		sm.becomeFollower(2, None)
-
+		// 收到领导者附加日志条目请求
 		sm.handleAppendEntries(tt.m)
 		if sm.RaftLog.LastIndex() != tt.wIndex {
 			t.Errorf("#%d: lastIndex = %d, want %d", i, sm.RaftLog.LastIndex(), tt.wIndex)
@@ -631,6 +700,7 @@ func TestHandleMessageType_MsgAppend2AB(t *testing.T) {
 	}
 }
 
+// 测试选举中投票者是否只投给一位候选者，且会正确地把选票投给日志和自己一样或更新的候选者
 func TestRecvMessageType_MsgRequestVote2AB(t *testing.T) {
 	msgType := pb.MessageType_MsgRequestVote
 	msgRespType := pb.MessageType_MsgRequestVoteResponse
@@ -688,14 +758,19 @@ func TestRecvMessageType_MsgRequestVote2AB(t *testing.T) {
 		// what the recipient node does when receiving a message with a
 		// different term number, so we simply initialize both term numbers to
 		// be the same.
+		// raft.Term 大于或等于 raft.RaftLog.lastTerm。在这个测试中，我们只测试当竞选节点与接收节点的 raft 日志不同时
+		// MessageType_MsgRequestVote 的响应。另一个重点是验证当接收节点已经在当前任期内投出了选票时的行为。我们并不测试
+		// 当接收节点收到具有不同任期编号的消息时的处理，因此我们简单地将两个任期编号初始化为相同。
 		lterm, err := sm.RaftLog.Term(sm.RaftLog.LastIndex())
 		if err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
 		term := max(lterm, tt.logTerm)
+		// 简单地将两个任期编号初始化为相同
 		sm.Term = term
 		sm.Step(pb.Message{MsgType: msgType, Term: term, From: 2, Index: tt.index, LogTerm: tt.logTerm})
 
+		// 比较投票者的行为是否与预期一致
 		msgs := sm.readMessages()
 		if g := len(msgs); g != 1 {
 			t.Fatalf("#%d: len(msgs) = %d, want 1", i, g)
@@ -710,6 +785,9 @@ func TestRecvMessageType_MsgRequestVote2AB(t *testing.T) {
 	}
 }
 
+// 测试节点收到更高任期的请求时，是否会正确回退为跟随者，并调整当前的任期和领导者
+// 如果收到来自更高任期的候选者的投票请求，当前节点会转变为跟随者，更新任期，领导者为空
+// 如果收到来自更高任期的领导者的附加日志条目请求，当前节点会转变为跟随者，更新任期，并把请求节点视为领导者
 func TestAllServerStepdown2AB(t *testing.T) {
 	tests := []struct {
 		state StateType
@@ -753,7 +831,9 @@ func TestAllServerStepdown2AB(t *testing.T) {
 			if uint64(len(sm.RaftLog.allEntries())) != tt.windex {
 				t.Errorf("#%d.%d len(ents) = %v , want %v", i, j, len(sm.RaftLog.allEntries()), tt.windex)
 			}
+			// 如果是附加条目请求那么节点 2 是领导者
 			wlead := uint64(2)
+			// 如果是投票请求那么节点 2 是候选者，没有领导者
 			if msgType == pb.MessageType_MsgRequestVote {
 				wlead = None
 			}
@@ -937,6 +1017,7 @@ func TestDisruptiveFollower2AA(t *testing.T) {
 	}
 }
 
+// 测试心跳消息不会更新提交索引，只有附加日志条目消息会使提交索引更新
 func TestHeartbeatUpdateCommit2AB(t *testing.T) {
 	tests := []struct {
 		failCnt    int
@@ -954,6 +1035,8 @@ func TestHeartbeatUpdateCommit2AB(t *testing.T) {
 		nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
 		nt.isolate(1)
 		// propose log to old leader should fail
+		// 向旧的领导者提议日志应该失败
+		// 领导者节点 1 被孤立，虽然自己附加日志成功，但是其他节点收不到请求，不会更新提交索引
 		for i := 0; i < tt.failCnt; i++ {
 			nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 		}
@@ -961,6 +1044,8 @@ func TestHeartbeatUpdateCommit2AB(t *testing.T) {
 			t.Fatalf("#%d: unexpected commit: %d", i, sm1.RaftLog.committed)
 		}
 		// propose log to cluster should success
+		// 向集群提议日志应该成功
+		// 节点 2 成为领导者，向节点 3 同步日志并成功提交
 		nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgHup})
 		for i := 0; i < tt.successCnt; i++ {
 			nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
@@ -974,8 +1059,10 @@ func TestHeartbeatUpdateCommit2AB(t *testing.T) {
 		}
 
 		nt.recover()
+		// 忽略所有的附加日志条目请求
 		nt.ignore(pb.MessageType_MsgAppend)
 		nt.send(pb.Message{From: 2, To: 2, MsgType: pb.MessageType_MsgBeat})
+		// 因为附加日志条目请求被忽略，节点 1 不会更新提交索引
 		if sm1.RaftLog.committed > 1 {
 			t.Fatalf("#%d: expected sm1 commit: 1, got: %d", i, sm1.RaftLog.committed)
 		}
@@ -1015,20 +1102,28 @@ func TestRecvMessageType_MsgBeat2AA(t *testing.T) {
 	}
 }
 
+// 测试领导者是否能正确增加其他节点的 nextIndex
 func TestLeaderIncreaseNext2AB(t *testing.T) {
 	previousEnts := []pb.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3}}
 	// previous entries + noop entry + propose + 1
-	wnext := uint64(len(previousEnts)) + 1 + 1 + 1
+	// 之前的条目 + 无操作条目 + 提议 + 1
+	wmatch := uint64(len(previousEnts)) + 1 + 1
+	wnext := wmatch + 1
 
 	storage := NewMemoryStorage()
 	storage.Append(previousEnts)
 	sm := newTestRaft(1, []uint64{1, 2}, 10, 1, storage)
 	nt := newNetwork(sm, nil, nil)
+	// 节点 1 发起选举成为领导者
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgHup})
-
+	// 领导者接收客户端提议
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("somedata")}}})
 
 	p := sm.Prs[2]
+	// 增加对 matchIndex 的校验
+	if p.Match != wmatch {
+		t.Errorf("match = %d, want %d", p.Match, wmatch)
+	}
 	if p.Next != wnext {
 		t.Errorf("next = %d, want %d", p.Next, wnext)
 	}
