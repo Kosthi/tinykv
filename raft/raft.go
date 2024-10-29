@@ -713,6 +713,12 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 	// Your Code Here (2A).
 	log.Debugf("%d receive appendResponse(%v) from %d", r.id, !m.Reject, m.From)
 
+	// 当前领导者节点过期，更新任期，回退为跟随者
+	if m.Term > r.Term {
+		r.becomeFollower(m.Term, None)
+		return
+	}
+
 	// 同步失败，跳转 next 重新同步
 	if m.Reject {
 		log.Debugf("%d received rejected appendResponse from %d. Decreasing Next to %d", r.id, m.From, r.Prs[m.From].Next-1)
@@ -780,15 +786,14 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 
 	// 检查接收到的任期
 	if m.Term > r.Term {
-		// 接收到的任期比当前节点任期大
-		r.Term = m.Term
-		if r.State != StateFollower {
-			r.becomeFollower(m.Term, m.From)
-		}
-	} else {
-		// 记录该节点对心跳响应作出了回复
-		r.heartbeatResp[m.From] = true
+		// 接收到的任期比当前领导者节点任期大，当前领导者节点过期了
+		// 更新任期，回退为跟随者
+		r.becomeFollower(m.Term, None)
+		return
 	}
+
+	// 记录该节点对心跳响应作出了回复
+	r.heartbeatResp[m.From] = true
 
 	// 收到心跳回复后，如果发现该节点日志条目过期，发起日志条目同步请求
 	if r.Prs[m.From].Match < r.RaftLog.LastIndex() {
