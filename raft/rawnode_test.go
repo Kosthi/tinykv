@@ -157,18 +157,25 @@ func TestRawNodeProposeAddDuplicateNode3A(t *testing.T) {
 
 // TestRawNodeStart ensures that a node can be started correctly, and can accept and commit
 // proposals.
+// TestRawNodeStart 测试确保单节点集群可以正确启动，并且能够接受和提交提案。
 func TestRawNodeStart2AC(t *testing.T) {
 	storage := NewMemoryStorage()
 	rawNode, err := NewRawNode(newTestConfig(1, []uint64{1}, 10, 1, storage))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 发起选举，单节点直接成为领导者
 	rawNode.Campaign()
+	// 返回当前时刻状态
 	rd := rawNode.Ready()
+	// 将不稳定的日志条目持久化
 	storage.Append(rd.Entries)
+	// 推进，更新 stabled 和 applied 指针
 	rawNode.Advance(rd)
 
+	// 提议附加数据
 	rawNode.Propose([]byte("foo"))
+	// 返回当前时刻状态
 	rd = rawNode.Ready()
 	if el := len(rd.Entries); el != len(rd.CommittedEntries) || el != 1 {
 		t.Errorf("got len(Entries): %+v, len(CommittedEntries): %+v, want %+v", el, len(rd.CommittedEntries), 1)
@@ -176,14 +183,17 @@ func TestRawNodeStart2AC(t *testing.T) {
 	if !reflect.DeepEqual(rd.Entries[0].Data, rd.CommittedEntries[0].Data) || !reflect.DeepEqual(rd.Entries[0].Data, []byte("foo")) {
 		t.Errorf("got %+v %+v , want %+v", rd.Entries[0].Data, rd.CommittedEntries[0].Data, []byte("foo"))
 	}
+	// 将不稳定的日志条目持久化
 	storage.Append(rd.Entries)
 	rawNode.Advance(rd)
 
+	// 没有待处理的 ready 了
 	if rawNode.HasReady() {
 		t.Errorf("unexpected Ready: %+v", rawNode.Ready())
 	}
 }
 
+// TestRawNodeRestart2AC 测试节点重启后能否从存储中正确恢复状态
 func TestRawNodeRestart2AC(t *testing.T) {
 	entries := []pb.Entry{
 		{Term: 1, Index: 1},
@@ -192,23 +202,29 @@ func TestRawNodeRestart2AC(t *testing.T) {
 	st := pb.HardState{Term: 1, Commit: 1}
 
 	want := Ready{
-		Entries: []pb.Entry{},
+		Entries: []pb.Entry{}, // 不稳定的日志条目写入稳定存储
 		// commit up to commit index in st
+		// 把已经提交的日志条目应用到状态机
 		CommittedEntries: entries[:st.Commit],
 	}
 
 	storage := NewMemoryStorage()
+	// 非易失状态才需要存储
 	storage.SetHardState(st)
 	storage.Append(entries)
+	// 从存储中恢复状态，期望把还没应用到状态机的已提交的日志条目应用到状态机
 	rawNode, err := NewRawNode(newTestConfig(1, nil, 10, 1, storage))
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 获取当前时刻状态
 	rd := rawNode.Ready()
 	if !reflect.DeepEqual(rd, want) {
 		t.Errorf("g = %#v,\n             w   %#v", rd, want)
 	}
+	// 推进，更新 stabled 和 applied 指针
 	rawNode.Advance(rd)
+	// 没有待处理的 ready 了
 	if rawNode.HasReady() {
 		t.Errorf("unexpected Ready: %+v", rawNode.Ready())
 	}
