@@ -19,5 +19,8 @@ jobs:
     - name: Build & Test
       run: make ci
 
+    - name: Test Project 1
+      run: make project1
+
     - name: Test Project 2A
       run: make project2a
