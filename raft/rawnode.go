@@ -46,7 +46,7 @@ type Ready struct {
 	// The current volatile state of a Node.
 	// SoftState will be nil if there is no update.
 	// It is not required to consume or store SoftState.
-	// 节点的当前易失状态。
+	// 当前节点的易失状态。
 	// 如果没有更新，SoftState 将为 nil。
 	// 不要求使用或存储 SoftState。
 	*SoftState
@@ -54,7 +54,7 @@ type Ready struct {
 	// The current state of a Node to be saved to stable storage BEFORE
 	// Messages are sent.
 	// HardState will be equal to empty state if there is no update.
-	// 当前节点的状态，在发送消息之前保存到稳定存储。
+	// 当前节点的非易失状态，在发送消息之前保存到稳定存储。
 	// 如果没有更新，HardState 将等于空状态。
 	pb.HardState
 
@@ -88,13 +88,30 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	// 前一个时刻的易失状态
+	prevSoftState *SoftState
+	// 前一个时刻的非易失状态
+	prevHardState pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 // NewRawNode 在给定配置和 Raft 节点列表的情况下返回一个新的 RawNode。
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	hardState, _, err := config.Storage.InitialState()
+	if err != nil {
+		return nil, err
+	}
+
+	raft := newRaft(config)
+
+	rawNode := &RawNode{
+		Raft:          raft,
+		prevSoftState: raft.softState(), // 当前时刻的易失状态
+		prevHardState: hardState,        // 从存储中恢复当前时刻的非易失状态
+	}
+
+	return rawNode, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -168,15 +185,49 @@ func (rn *RawNode) Step(m pb.Message) error {
 
 // Ready returns the current point-in-time state of this RawNode.
 // Ready 返回此 RawNode 的当前时刻状态。
-func (rn *RawNode) Ready() Ready {
+func (rn *RawNode) Ready() (rd Ready) {
 	// Your Code Here (2A).
-	return Ready{}
+	raft := rn.Raft
+
+	// 获取当前时刻的易失状态，没有更新时为 nil
+	if softState := raft.softState(); !isSoftStateEqual(softState, rn.prevSoftState) {
+		rn.prevSoftState = softState
+		rd.SoftState = softState
+	}
+
+	// 获取当前时刻的非易失状态，没有更新时为空状态
+	if hardState := raft.hardState(); !isHardStateEqual(hardState, rn.prevHardState) {
+		rn.prevHardState = hardState
+		rd.HardState = hardState
+	}
+
+	// 获取当前时刻节点不稳定的日志条目
+	rd.Entries = raft.RaftLog.unstableEntries()
+	// 获取当前时刻节点已经提交的日志条目
+	rd.CommittedEntries = raft.RaftLog.nextEnts()
+	// 获取当前时刻节点需要发出的消息
+	rd.Messages = rn.Raft.msgs
+
+	return
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 // HasReady 在 RawNode 用户需要检查是否有任何待处理的 Ready 时被调用。
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	raft := rn.Raft
+	// 易失状态是否改变
+	if softState := raft.softState(); !isSoftStateEqual(softState, rn.prevSoftState) {
+		return true
+	}
+	// 非易失状态是否改变
+	if hardState := raft.hardState(); !isHardStateEqual(hardState, rn.prevHardState) {
+		return true
+	}
+	// 是否有待持久化的日志条目或待处理的消息
+	if len(raft.RaftLog.unstableEntries()) > 0 || len(raft.RaftLog.nextEnts()) > 0 || len(raft.msgs) > 0 {
+		return true
+	}
 	return false
 }
 
@@ -185,6 +236,21 @@ func (rn *RawNode) HasReady() bool {
 // Advance 通知 RawNode 应用程序已经应用并保存了在上一个 Ready 结果中的进展。
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	raft := rn.Raft
+
+	// 更新写入稳定存储的 stabled 指针
+	if len(rd.Entries) > 0 {
+		raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	// 更新应用到状态机的 applied 指针
+	if len(rd.CommittedEntries) > 0 {
+		raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+		// 把已经应用到状态机的日志条目移除
+		raft.RaftLog.entries = raft.RaftLog.entries[raft.RaftLog.applied-raft.RaftLog.FirstIndex()+1:]
+	}
+
+	// 消息处理完了，清空消息
+	raft.msgs = make([]pb.Message, 0)
 }
 
 // GetProgress return the Progress of this node and its peers, if this

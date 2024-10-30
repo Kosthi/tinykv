@@ -261,6 +261,25 @@ func newRaft(c *Config) *Raft {
 	}
 }
 
+// softState 返回节点当前时刻的易失状态
+func (r *Raft) softState() *SoftState {
+	// Your Code Here (2A).
+	return &SoftState{
+		Lead:      r.Lead,
+		RaftState: r.State,
+	}
+}
+
+// hardState 返回节点当前时刻的非易失状态
+func (r *Raft) hardState() pb.HardState {
+	// Your Code Here (2A).
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
 // sendAppend 向指定节点发送一个追加条目 RPC，包括新的条目（如果有的话）和当前的提交索引。
@@ -527,11 +546,13 @@ func (r *Raft) becomeLeader() {
 
 	log.Debugf("%d became leader at term %d", r.id, r.Term)
 
-	// 集群只有单个节点时不会发送附加日志请求，领导者直接更新日志
+	// 集群只有单个节点时不会发送附加日志请求，领导者直接提交日志
 	if len(r.Prs) == 1 {
-		r.RaftLog.stabled++
+		log.Debugf("%d updating committed index from %d to %d", r.id, r.RaftLog.committed, r.RaftLog.committed+1)
+		// 直接自增提交索引
 		r.RaftLog.committed++
-		// r.RaftLog.applied 不知道什么时候应用到状态机
+		// 由上层调用 RawNode 的 Ready 得到已经提交的日志条目，再应用到状态机
+		// 上层还会把不稳定还没提交的日志条目持久化到存储中，使之稳定
 	} else {
 		// 发送附加条目请求给其他节点
 		r.sendAllAppend()
@@ -901,13 +922,15 @@ func (r *Raft) handlePropose(m pb.Message) {
 	// 追加日志条目
 	r.appendEntry(m.Entries)
 
-	// 集群只有单个节点时不会发送附加日志请求，领导者直接更新日志
+	// 集群只有单个节点时不会发送附加日志请求，领导者直接提交日志
 	if len(r.Prs) == 1 {
-		r.RaftLog.stabled++
+		log.Debugf("%d updating committed index from %d to %d", r.id, r.RaftLog.committed, r.RaftLog.committed+1)
+		// 直接自增提交索引
 		r.RaftLog.committed++
-		// r.RaftLog.applied 不知道什么时候应用到状态机
+		// 由上层调用 RawNode 的 Ready 得到已经提交的日志条目，再应用到状态机
+		// 上层还会把不稳定还没提交的日志条目持久化到存储中，使之稳定
 	} else {
-		// 发送 AppendEntries RPC 给所有其他节点
+		// 发送附加条目请求给其他节点
 		r.sendAllAppend()
 	}
 }

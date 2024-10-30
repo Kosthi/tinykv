@@ -124,6 +124,14 @@ func IsResponseMsg(msgt pb.MessageType) bool {
 	return msgt == pb.MessageType_MsgAppendResponse || msgt == pb.MessageType_MsgRequestVoteResponse || msgt == pb.MessageType_MsgHeartbeatResponse
 }
 
+func isSoftStateEqual(a, b *SoftState) bool {
+	// Your Code Here (2A).
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.Lead == b.Lead && a.RaftState == b.RaftState
+}
+
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
 }
