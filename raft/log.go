@@ -49,9 +49,10 @@ type RaftLog struct {
 	// log entries with index <= stabled are persisted to storage.
 	// It is used to record the logs that are not persisted by storage yet.
 	// Everytime handling `Ready`, the unstabled logs will be included.
-	// stabled 表示所有已被多数节点复制，但是未写入持久化存储的日志条目的最小的索引。
+	// stabled 表示已经写入持久化存储的日志条目的最高索引。
 	// 这意味着所有索引小于或等于 stabled 的日志条目已经安全存储，并可以在故障恢复后使用。
 	// 每次处理 `Ready` 时，未稳定的日志条目将被包含在内。
+	// 注意，这里稳定的语义是指写入了持久化存储中，但是不一定复制到了大多数节点并提交。
 	stabled uint64
 
 	// all entries that have not yet compact.
@@ -127,21 +128,45 @@ func (l *RaftLog) allEntries() []pb.Entry {
 
 // unstableEntries return all the unstable entries
 // unstableEntries 返回所有不稳定的条目。
-func (l *RaftLog) unstableEntries() []pb.Entry {
+func (l *RaftLog) unstableEntries() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return l.entries[l.stabled:]
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		if l.stabled < firstIndex {
+			return l.entries
+		}
+		if l.stabled-firstIndex+1 < uint64(len(l.entries)) {
+			return l.entries[l.stabled-firstIndex+1:]
+		}
+	}
+	// 测试里要求返回空条目而不是 nil
+	return []pb.Entry{}
 }
 
 // nextEnts returns all the committed but not applied entries
 // nextEnts 返回所有已提交但未应用的条目。
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	// Your Code Here (2A).
-	return l.entries[l.applied:l.committed]
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		if l.applied+1 >= firstIndex {
+			return l.entries[l.applied-firstIndex+1 : l.committed-firstIndex+1]
+		}
+	}
+	// 虽然测试没要求，但是与 unstableEntries 一致
+	return []pb.Entry{}
 }
 
 // FirstIndex 返回日志条目的第一个索引。
 func (l *RaftLog) FirstIndex() uint64 {
 	// Your Code Here (2A).
+	if len(l.entries) == 0 {
+		firstIndex, err := l.storage.FirstIndex()
+		if err != nil {
+			panic(err.Error())
+		}
+		return firstIndex
+	}
 	return l.entries[0].Index
 }
 
