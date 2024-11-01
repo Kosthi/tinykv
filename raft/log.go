@@ -115,6 +115,30 @@ func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
 }
 
+func (l *RaftLog) Entry(index uint64) *pb.Entry {
+	// Your Code Here (2A).
+	if len(l.entries) > 0 && l.entries[0].Index <= index {
+		firstIndex := l.entries[0].Index
+		if index <= l.LastIndex() {
+			return &l.entries[index-firstIndex]
+		}
+		log.Panicf("Entry's index(%d) is out of bound lastindex(%d)", index, l.LastIndex())
+	}
+	entry, err := l.storage.Entries(index, index+1)
+	if err != nil {
+		panic(err.Error())
+	}
+	return &entry[0]
+}
+
+func (l *RaftLog) Entries(lo, hi uint64) []*pb.Entry {
+	var entries []*pb.Entry
+	for i := lo; i < hi; i++ {
+		entries = append(entries, l.Entry(i))
+	}
+	return entries
+}
+
 // allEntries return all the entries not compacted.
 // note, exclude any dummy entries from the return value.
 // note, this is one of the test stub functions you need to implement.

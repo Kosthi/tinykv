@@ -286,8 +286,6 @@ func (r *Raft) hardState() pb.HardState {
 // 如果发送了消息，则返回 true。
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-	var entries []*pb.Entry
-
 	peer := r.Prs[to]
 	prevLogIndex := peer.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
@@ -296,10 +294,8 @@ func (r *Raft) sendAppend(to uint64) bool {
 		return false
 	}
 
-	firstIndex := r.RaftLog.FirstIndex()
-	for i := peer.Next; i <= r.RaftLog.LastIndex(); i++ {
-		entries = append(entries, &r.RaftLog.entries[i-firstIndex])
-	}
+	lastIndex := r.RaftLog.LastIndex()
+	entries := r.RaftLog.Entries(peer.Next, lastIndex+1)
 
 	// 添加附加日志请求到待发送消息队列
 	r.msgs = append(r.msgs, pb.Message{
@@ -335,6 +331,7 @@ func (r *Raft) sendAppendResponse(to uint64, lastIndex uint64, reject bool) {
 		Index:   lastIndex,
 		Reject:  reject,
 	})
+	log.Debugf("%d sent AppendResponse to %d: lastIndex=%d, reject=%t", r.id, to, lastIndex, reject)
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
