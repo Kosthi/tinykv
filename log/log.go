@@ -270,6 +270,7 @@ func LogTypeToString(t LogType) (string, string) {
 }
 
 func New() *Logger {
+	os.Setenv("LOG_LEVEL", "none")
 	return NewLogger(os.Stderr, "")
 }
 
