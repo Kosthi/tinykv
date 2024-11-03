@@ -389,19 +389,19 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	// 用于写入 raft 数据的 batch
 	raftWB := new(engine_util.WriteBatch)
 
-	// 如果硬状态不为空，则更新节点 raft 状态
+	// 如果硬状态不为空，则更新节点的 ps.raftState
 	if !raft.IsEmptyHardState(ready.HardState) {
 		ps.raftState.HardState = &ready.HardState
 	}
 
-	// 将节点新的 raft 状态写入 batch
-	err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	// 将不稳定的日志条目写入 batch，同时更新节点的 ps.raftState
+	err := ps.Append(ready.Entries, raftWB)
 	if err != nil {
 		return nil, err
 	}
 
-	// 将不稳定的日志条目写入 batch
-	err = ps.Append(ready.Entries, raftWB)
+	// 将节点新的 ps.raftState 写入 batch，注意要在所有改动完成后再写入
+	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	if err != nil {
 		return nil, err
 	}
