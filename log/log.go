@@ -247,6 +247,8 @@ func StringToLogLevel(level string) LogLevel {
 		return LOG_LEVEL_DEBUG
 	case "info":
 		return LOG_LEVEL_INFO
+	case "none":
+		return LOG_LEVEL_NONE
 	}
 	return LOG_LEVEL_ALL
 }
@@ -276,7 +278,7 @@ func NewLogger(w io.Writer, prefix string) *Logger {
 	if l := os.Getenv("LOG_LEVEL"); len(l) != 0 {
 		level = StringToLogLevel(os.Getenv("LOG_LEVEL"))
 	} else {
-		level = LOG_LEVEL_INFO
+		level = LOG_LEVEL_NONE
 	}
 	return &Logger{_log: log.New(w, prefix, LstdFlags), level: level, highlighting: true}
 }
