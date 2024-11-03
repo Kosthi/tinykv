@@ -24,6 +24,7 @@ import (
 
 type ApplySnapResult struct {
 	// PrevRegion is the region before snapshot applied
+	// PrevRegion 是快照应用之前的区域。
 	PrevRegion *metapb.Region
 	Region     *metapb.Region
 }
@@ -32,25 +33,34 @@ var _ raft.Storage = new(PeerStorage)
 
 type PeerStorage struct {
 	// current region information of the peer
+	// 节点的当前区域信息
 	region *metapb.Region
 	// current raft state of the peer
+	// 节点的当前 Raft 状态
 	raftState *rspb.RaftLocalState
 	// current apply state of the peer
+	// 节点的当前应用状态
 	applyState *rspb.RaftApplyState
 
 	// current snapshot state
+	// 当前快照状态
 	snapState snap.SnapState
 	// regionSched used to schedule task to region worker
+	// regionSched 用于将任务调度到区域工作者
 	regionSched chan<- worker.Task
 	// generate snapshot tried count
+	// 生成快照尝试计数
 	snapTriedCnt int
 	// Engine include two badger instance: Raft and Kv
+	// 引擎包含两个 Badger 实例：Raft 和 Kv
 	Engines *engine_util.Engines
 	// Tag used for logging
+	// 用于日志记录的标签
 	Tag string
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
+// NewPeerStorage 从引擎中获取持久化的 raftState 并返回一个节点存储。
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
@@ -112,6 +122,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 			return nil, err
 		}
 		// May meet gap or has been compacted.
+		// 可能遇到间隙或已被压缩。
 		if entry.Index != nextIndex {
 			break
 		}
@@ -119,10 +130,12 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 		buf = append(buf, entry)
 	}
 	// If we get the correct number of entries, returns.
+	// 如果获取到正确数量的条目，则返回。
 	if len(buf) == int(high-low) {
 		return buf, nil
 	}
 	// Here means we don't fetch enough entries.
+	// 这里表示我们没有获取到足够的条目。
 	return nil, raft.ErrUnavailable
 }
 
@@ -306,8 +319,48 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+// Append 将给定条目附加到 Raft 日志并更新 ps.raftState，同时删除永远不会被提交的日志条目。
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	if len(entries) > 0 {
+		psFirstIndex, err := ps.FirstIndex()
+		if err != nil {
+			return err
+		}
+		psLastIndex, err := ps.LastIndex()
+		if err != nil {
+			return err
+		}
+
+		entryFirstIndex := entries[0].Index
+		entryLastIndex := entries[len(entries)-1].Index
+
+		// 日志条目已经存在
+		if entryLastIndex < psFirstIndex {
+			return nil
+		}
+		// 截去不需要的日志条目头部
+		if entryFirstIndex < psFirstIndex {
+			entries = entries[psFirstIndex-entryFirstIndex:]
+		}
+
+		// 写入 batch
+		for _, entry := range entries {
+			err = raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
+			if err != nil {
+				return err
+			}
+		}
+
+		// 截去不需要的日志条目尾部
+		for i := entryLastIndex + 1; i <= psLastIndex; i++ {
+			raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, i))
+		}
+
+		// 更新节点 raft 状态
+		ps.raftState.LastIndex = entries[len(entries)-1].Index
+		ps.raftState.LastTerm = entries[len(entries)-1].Term
+	}
 	return nil
 }
 
@@ -328,9 +381,37 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// 将内存状态保存到磁盘。
+// 在此函数中不要修改 ready，这是后续正确推进 ready 对象的要求。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	// 用于写入 raft 数据的 batch
+	raftWB := new(engine_util.WriteBatch)
+
+	// 如果硬状态不为空，则更新节点 raft 状态
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	// 将节点新的 raft 状态写入 batch
+	err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+	if err != nil {
+		return nil, err
+	}
+
+	// 将不稳定的日志条目写入 batch
+	err = ps.Append(ready.Entries, raftWB)
+	if err != nil {
+		return nil, err
+	}
+
+	// batch 中的数据以事务的方式原子地写入数据库
+	err = ps.Engines.WriteRaft(raftWB)
+	if err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 
