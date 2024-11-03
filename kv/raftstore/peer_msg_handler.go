@@ -2,6 +2,9 @@ package raftstore
 
 import (
 	"fmt"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -38,11 +41,235 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// HandleRaftReady 处理 Raft 状态准备就绪的信号。
+// 如果 Raft 节点已经停止，则此方法不会执行任何操作。
+// 它会检查 Raft 状态，持久化当前状态，发送消息，并应用已提交的日志条目。
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
+		log.Warnf("%s is stopped, skipping HandleRaftReady", d.Tag)
 		return
 	}
+
 	// Your Code Here (2B).
+	rawNode := d.RaftGroup
+	// 是否有待处理的 ready
+	if rawNode.HasReady() {
+		// 获取当前状态
+		rd := rawNode.Ready()
+
+		// 持久化当前状态
+		if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+			log.Panicf("%s failed to save ready state: %v", d.Tag, err)
+		}
+
+		// 发送消息
+		d.Send(d.ctx.trans, rd.Messages)
+
+		// 应用已经提交的日志条目
+		if err := d.applyCommittedEntries(&rd.CommittedEntries); err != nil {
+			log.Panicf("%s failed to apply committed entries: %v", d.Tag, err)
+		}
+
+		// 推进节点状态
+		rawNode.Advance(rd)
+		log.Infof("%s advances state after processing ready", d.Tag)
+	}
+}
+
+// dropStaleProposal 处理过时提案将其丢弃。
+func (d *peerMsgHandler) dropStaleProposal(entry *eraftpb.Entry) {
+	// 如果不是领导者，不需要处理提议，直接把提议清空
+	if !d.IsLeader() {
+		d.proposals = d.proposals[:0]
+		return
+	}
+
+	i := 0
+	length := len(d.proposals)
+
+	// 遍历提议列表
+	for ; i < length; i++ {
+		proposal := d.proposals[i]
+
+		// 未应用的过期日志，需要应用，不能丢弃，直接跳出循环
+		if entry.Index < proposal.index {
+			break
+		}
+
+		// 由于领导者更改导致一些日志未提交，并且已经被新领导者的日志强制覆盖。
+		// 当前提议过期了，调用回调函数告诉客户端，返回 ErrStaleCommand 错误
+		if entry.Index > proposal.index {
+			log.Warnf("%s Stale proposal detected: Index=%d, Term=%d; notifying callback", d.Tag, proposal.index, proposal.term)
+			NotifyStaleReq(proposal.term, proposal.cb)
+			continue
+		}
+
+		// 到这里索引相同，再判断任期
+		// 当前提议过期了，调用回调函数告诉客户端，返回 ErrStaleCommand 错误
+		if entry.Term > proposal.term {
+			log.Warnf("%s Stale proposal detected: Index=%d, Term=%d; notifying callback", d.Tag, proposal.index, proposal.term)
+			NotifyStaleReq(proposal.term, proposal.cb)
+			continue
+		}
+
+		// 到这里，索引相同且 entry.Term <= proposal.term，是不能丢弃的日志条目，可以直接跳出循环了
+		break
+	}
+
+	// 如果所有提案都被认为是过期的，则清空提案列表
+	if i == length {
+		log.Debugf("%s All proposals are stale; resetting the proposals", d.Tag)
+		d.proposals = d.proposals[:0]
+	} else {
+		// 否则，保留有效提议，从第 i 个开始
+		log.Debugf("%s Keeping valid proposals, starting from index %d", d.Tag, i)
+		d.proposals = d.proposals[i:]
+	}
+}
+
+// applyCommittedEntries 应用已提交的日志条目
+func (d *peerMsgHandler) applyCommittedEntries(entries *[]eraftpb.Entry) error {
+	kvWB := new(engine_util.WriteBatch)
+	for _, entry := range *entries {
+		if err := d.applyEntry(&entry, kvWB); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 单个日志条目的应用
+func (d *peerMsgHandler) applyEntry(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) error {
+	kvWB.Reset()
+	if entry.Data != nil {
+		if err := d.applyEntryData(entry, kvWB); err != nil {
+			return err
+		}
+	}
+	// 更新已应用的索引状态
+	d.peerStorage.applyState.AppliedIndex = entry.Index
+	// 写入 kv batch
+	return d.writeApplyState(kvWB)
+}
+
+// processEntryData 处理日志条目的数据
+func (d *peerMsgHandler) applyEntryData(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) error {
+	msg := raft_cmdpb.RaftCmdRequest{}
+	if err := msg.Unmarshal(entry.Data); err != nil {
+		log.Errorf("%s failed to unmarshal entry data: %v", d.Tag, err)
+		return err
+	}
+
+	req := msg.Requests[0]
+	d.dropStaleProposal(entry)
+
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Put:
+		return d.applyPut(req.Put, entry, kvWB)
+	case raft_cmdpb.CmdType_Get:
+		return d.applyGet(req.Get, entry)
+	case raft_cmdpb.CmdType_Delete:
+		return d.applyDelete(req.Delete, entry, kvWB)
+	case raft_cmdpb.CmdType_Snap:
+		return d.applySnap(entry)
+	default:
+		log.Warnf("%s unknown command type: %v", d.Tag, req.CmdType)
+		return nil
+	}
+}
+
+// applyPut 应用 Put 请求
+func (d *peerMsgHandler) applyPut(req *raft_cmdpb.PutRequest, entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) error {
+	kvWB.SetCF(req.Cf, req.Key, req.Value)
+	log.Infof("%s applied Put: key=%s, value=%s", d.Tag, req.Key, req.Value)
+
+	return d.respondToProposal([]*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Put,
+		Put:     &raft_cmdpb.PutResponse{},
+	}}, entry)
+}
+
+// applyGet 应用 Get 请求
+func (d *peerMsgHandler) applyGet(req *raft_cmdpb.GetRequest, entry *eraftpb.Entry) error {
+	val, err := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Cf, req.Key)
+	if err != nil {
+		log.Errorf("%s failed to get value for key=%s: %v", d.Tag, req.Key, err)
+		return err
+	}
+
+	log.Infof("%s applied Get: key=%s, value=%s", d.Tag, req.Key, val)
+
+	return d.respondToProposal([]*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Get,
+		Get: &raft_cmdpb.GetResponse{
+			Value: val,
+		},
+	}}, entry)
+}
+
+// applyDelete 应用 Delete 请求
+func (d *peerMsgHandler) applyDelete(req *raft_cmdpb.DeleteRequest, entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) error {
+	kvWB.DeleteCF(req.Cf, req.Key)
+	log.Infof("%s applied Delete: key=%s", d.Tag, req.Key)
+
+	return d.respondToProposal([]*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Delete,
+		Delete:  &raft_cmdpb.DeleteResponse{},
+	}}, entry)
+}
+
+// applySnap 应用 Snap 请求
+func (d *peerMsgHandler) applySnap(entry *eraftpb.Entry) error {
+	log.Infof("%s applied Snap", d.Tag)
+
+	return d.respondToProposal([]*raft_cmdpb.Response{{
+		CmdType: raft_cmdpb.CmdType_Snap,
+		Snap: &raft_cmdpb.SnapResponse{
+			Region: d.Region(),
+		},
+	}}, entry)
+}
+
+// respondToProposal 向提议回调返回响应
+func (d *peerMsgHandler) respondToProposal(resp []*raft_cmdpb.Response, entry *eraftpb.Entry) error {
+	if len(d.proposals) == 0 {
+		return nil
+	}
+
+	proposal := d.proposals[0]
+
+	// 当成为新领导者的节点，因为没有存储原来客户端的提议，过期的日志条目可能还没应用，但是已经被旧的领导者响应了，这里只需要应用即可
+	// 既不需要响应也找不到原来的提议响应了
+	if entry.Index < proposal.index {
+
+	} else if proposal.term != entry.Term {
+		NotifyStaleReq(entry.Term, proposal.cb)
+		d.proposals = d.proposals[1:]
+	} else {
+		cmdResp := &raft_cmdpb.RaftCmdResponse{
+			Header:    &raft_cmdpb.RaftResponseHeader{},
+			Responses: resp,
+		}
+		// 调用回调函数发送响应
+		if resp[0].CmdType == raft_cmdpb.CmdType_Snap {
+			// 显式开启一个事务
+			proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+		}
+		proposal.cb.Done(cmdResp)
+		d.proposals = d.proposals[1:]
+	}
+
+	return nil
+}
+
+// writeApplyState 写入应用状态
+func (d *peerMsgHandler) writeApplyState(kvWB *engine_util.WriteBatch) error {
+	if err := kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState); err != nil {
+		log.Errorf("%s failed to update apply state: %v", d.Tag, err)
+		return err
+	}
+	// 写入数据库
+	return d.peerStorage.Engines.WriteKV(kvWB)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -73,11 +300,13 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 
 func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) error {
 	// Check store_id, make sure that the msg is dispatched to the right place.
+	// 检查 store_id，确保消息被分发到正确的位置。
 	if err := util.CheckStoreID(req, d.storeID()); err != nil {
 		return err
 	}
 
 	// Check whether the store has the right peer to handle the request.
+	// 检查该存储是否有合适的 peer 来处理请求。
 	regionID := d.regionId
 	leaderID := d.LeaderId()
 	if !d.IsLeader() {
@@ -85,10 +314,12 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		return &util.ErrNotLeader{RegionId: regionID, Leader: leader}
 	}
 	// peer_id must be the same as peer's.
+	// peer_id 必须与 peer 的一致。
 	if err := util.CheckPeerID(req, d.PeerId()); err != nil {
 		return err
 	}
 	// Check whether the term is stale.
+	// 检查选举周期是否过时。
 	if err := util.CheckTerm(req, d.Term()); err != nil {
 		return err
 	}
@@ -98,6 +329,8 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 		// matter if the region is not split from the current region. If the region meta
 		// received by the TiKV driver is newer than the meta cached in the driver, the meta is
 		// updated.
+		// 附加可能从当前区域分裂出来的区域。但如果该区域不是从当前区域分裂出来的，这并不重要。
+		// 如果 TiKV 驱动接收到的区域元数据比驱动中缓存的元数据更新，则会更新元数据。
 		siblingRegion := d.findSiblingRegion()
 		if siblingRegion != nil {
 			errEpochNotMatching.Regions = append(errEpochNotMatching.Regions, siblingRegion)
@@ -107,13 +340,65 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// proposeRaftCommand 处理来自客户端的 RaftCmdRequest，将其转换为 Raft 提议并提交到 Raft 集群中。
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	// 在提交之前进行预处理，如检查请求的合法性等
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
+		log.Errorf("%s proposal pre-check failed: %v", d.Tag, err)
 		cb.Done(ErrResp(err))
 		return
 	}
+
 	// Your Code Here (2B).
+	for _, req := range msg.Requests {
+		var key []byte
+		// 根据请求类型提取相应的 key
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			key = req.Put.Key
+		case raft_cmdpb.CmdType_Get:
+			key = req.Get.Key
+		case raft_cmdpb.CmdType_Delete:
+			key = req.Delete.Key
+		}
+
+		// 检查该 key 是否在当前 Region 中有效
+		err = util.CheckKeyInRegion(key, d.Region())
+		if err != nil {
+			log.Warnf("%s key %s is not valid in current region: %v", d.Tag, key, err)
+			// 如果 key 无效，调用回调并返回错误响应
+			cb.Done(ErrResp(err))
+			continue
+		}
+
+		// 将请求序列化为字节数组，以便向 Raft 集群提议
+		data, err := msg.Marshal()
+		if err != nil {
+			log.Errorf("%s failed to marshal RaftCmdRequest: %v", d.Tag, err)
+			// 序列化失败，调用回调并返回错误响应
+			cb.Done(ErrResp(err))
+			continue
+		}
+
+		// 提议数据到 Raft 集群，触发 Raft 的日志复制过程
+		err = d.RaftGroup.Propose(data)
+		if err != nil {
+			log.Errorf("%s proposal failed: %v", d.Tag, err)
+			// 提议失败，调用回调并返回错误响应
+			cb.Done(ErrResp(err))
+			continue
+		}
+
+		// 创建一个新的提议，将其添加到提议队列中
+		d.proposals = append(d.proposals, &proposal{
+			index: d.nextProposalIndex() - 1, // 当前提议的索引
+			term:  d.Term(),                  // 当前任期
+			cb:    cb,                        // 当前回调函数
+		})
+
+		log.Infof("%s successfully proposed command for key: %s", d.Tag, key)
+	}
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -210,7 +495,7 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	regionID := msg.GetRegionId()
 	from := msg.GetFromPeer()
 	to := msg.GetToPeer()
-	log.Debugf("[region %d] handle raft message %s from %d to %d", regionID, msg, from.GetId(), to.GetId())
+	log.Debugf("[region %d] handle raft message from %d to %d", regionID, from.GetId(), to.GetId())
 	if to.GetStoreId() != d.storeID() {
 		log.Warnf("[region %d] store not match, to store id %d, mine %d, ignore it",
 			regionID, to.GetStoreId(), d.storeID())
@@ -223,9 +508,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
