@@ -24,3 +24,9 @@ jobs:
 
     - name: Test Project 2A
       run: make project2a
+
+    - name: Test Project 2B
+      run: make project2b
+
+    - name: Test Project 2C
+      run: make project2c
