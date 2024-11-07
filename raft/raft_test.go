@@ -1193,6 +1193,7 @@ func TestOldLeaderAppend2AB(t *testing.T) {
 	}
 }
 
+// 测试是否能从一个快照中恢复
 func TestRestoreSnapshot2C(t *testing.T) {
 	s := pb.Snapshot{
 		Metadata: &pb.SnapshotMetadata{
@@ -1218,6 +1219,7 @@ func TestRestoreSnapshot2C(t *testing.T) {
 	}
 }
 
+// 测试是否能忽略一个过期快照
 func TestRestoreIgnoreSnapshot2C(t *testing.T) {
 	previousEnts := []pb.Entry{{Term: 1, Index: 1}, {Term: 1, Index: 2}, {Term: 1, Index: 3}}
 	storage := NewMemoryStorage()
@@ -1236,14 +1238,17 @@ func TestRestoreIgnoreSnapshot2C(t *testing.T) {
 	}
 
 	// ignore snapshot
+	// 忽略快照
 	sm.handleSnapshot(pb.Message{Snapshot: &s})
 	if sm.RaftLog.committed != wcommit {
 		t.Errorf("commit = %d, want %d", sm.RaftLog.committed, wcommit)
 	}
 }
 
+// 测试发现欲发送的日志条目已经被压缩后，能否发送快照
 func TestProvideSnap2C(t *testing.T) {
 	// restore the state machine from a snapshot so it has a compacted log and a snapshot
+	// 从快照恢复状态机，以便它具有压缩的日志和快照
 	s := pb.Snapshot{
 		Metadata: &pb.SnapshotMetadata{
 			Index:     11, // magic number
@@ -1260,6 +1265,7 @@ func TestProvideSnap2C(t *testing.T) {
 	sm.readMessages() // clear message
 
 	// force set the next of node 2 to less than the SnapshotMetadata.Index, so that node 2 needs a snapshot
+	// 将节点 2 的下一个日志条目索引强制设置为小于 SnapshotMetadata.Index，以便节点 2 需要一个快照
 	sm.Prs[2].Next = 10
 	sm.Step(pb.Message{From: 2, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{Data: []byte("somedata")}}})
 
@@ -1273,6 +1279,7 @@ func TestProvideSnap2C(t *testing.T) {
 	}
 }
 
+// 测试能否从一个快照中恢复领导者信息
 func TestRestoreFromSnapMsg2C(t *testing.T) {
 	s := pb.Snapshot{
 		Metadata: &pb.SnapshotMetadata{
@@ -1291,6 +1298,7 @@ func TestRestoreFromSnapMsg2C(t *testing.T) {
 	}
 }
 
+// 测试能否从快照从恢复正确的集群信息
 func TestRestoreFromSnapWithOverlapingPeersMsg2C(t *testing.T) {
 	s := pb.Snapshot{
 		Metadata: &pb.SnapshotMetadata{
@@ -1337,14 +1345,18 @@ func TestSlowNodeRestore2C(t *testing.T) {
 
 	// send heartbeats so that the leader can learn everyone is active.
 	// node 3 will only be considered as active when node 1 receives a reply from it.
+	// 发送心跳，以便领导者了解所有节点的活跃状态。
+	// 节点 3 仅在节点 1 收到来自节点 3 的回复时，才会被视为处于活动状态。
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgBeat})
 
 	// trigger a snapshot
+	// 触发快照
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 
 	follower := nt.peers[3].(*Raft)
 
 	// trigger a commit
+	// 触发提交
 	nt.send(pb.Message{From: 1, To: 1, MsgType: pb.MessageType_MsgPropose, Entries: []*pb.Entry{{}}})
 	if follower.RaftLog.committed != lead.RaftLog.committed {
 		t.Errorf("follower.committed = %d, want %d", follower.RaftLog.committed, lead.RaftLog.committed)
