@@ -24,6 +24,8 @@ import (
 
 // RaftStorage is an implementation of `Storage` (see tikv/server.go) backed by a Raft node. It is part of a Raft network.
 // By using Raft, reads and writes are consistent with other nodes in the TinyKV instance.
+// RaftStorage 是 `Storage` 的实现（见 tikv/server.go），其由 Raft 节点支持。它是 Raft 网络的一部分。
+// 通过使用 Raft，读取和写入在 TinyKV 实例中的其他节点是一致的。
 type RaftStorage struct {
 	engines *engine_util.Engines
 	config  *config.Config
@@ -58,6 +60,7 @@ func (rs *RaftStorage) checkResponse(resp *raft_cmdpb.RaftCmdResponse, reqCount 
 }
 
 // NewRaftStorage creates a new storage engine backed by a raftstore.
+// NewRaftStorage 创建一个由 raftstore 支持的新存储引擎。
 func NewRaftStorage(conf *config.Config) *RaftStorage {
 	dbPath := conf.DBPath
 	kvPath := filepath.Join(dbPath, "kv")
