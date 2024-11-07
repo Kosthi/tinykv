@@ -5,6 +5,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
+	"reflect"
 	"time"
 
 	"github.com/Connor1996/badger/y"
@@ -58,8 +59,21 @@ func (d *peerMsgHandler) HandleRaftReady() {
 		rd := rawNode.Ready()
 
 		// 持久化当前状态
-		if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		applySnapRet, err := d.peerStorage.SaveReadyState(&rd)
+		if err != nil {
 			log.Panicf("%s failed to save ready state: %v", d.Tag, err)
+		}
+
+		// 应用快照后分区可能改变
+		if applySnapRet != nil {
+			if !reflect.DeepEqual(applySnapRet.PrevRegion, applySnapRet.Region) {
+				d.peerStorage.SetRegion(applySnapRet.Region)
+				d.ctx.storeMeta.Lock()
+				d.ctx.storeMeta.regions[applySnapRet.Region.Id] = applySnapRet.Region
+				d.ctx.storeMeta.regionRanges.Delete(&regionItem{region: applySnapRet.PrevRegion})
+				d.ctx.storeMeta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapRet.Region})
+				d.ctx.storeMeta.Unlock()
+			}
 		}
 
 		// 发送消息
@@ -159,23 +173,49 @@ func (d *peerMsgHandler) applyEntryData(entry *eraftpb.Entry, kvWB *engine_util.
 		log.Errorf("%s failed to unmarshal entry data: %v", d.Tag, err)
 		return err
 	}
-
-	req := msg.Requests[0]
+	// 先尝试丢弃过期的提议
 	d.dropStaleProposal(entry)
+	// 应用提议至状态机
+	if msg.AdminRequest != nil {
+		return d.applyAdminRequest(msg.AdminRequest)
+	} else {
+		return d.applyNormalRequests(msg.Requests, entry, kvWB)
+	}
+}
 
-	switch req.CmdType {
-	case raft_cmdpb.CmdType_Put:
-		return d.applyPut(req.Put, entry, kvWB)
-	case raft_cmdpb.CmdType_Get:
-		return d.applyGet(req.Get, entry)
-	case raft_cmdpb.CmdType_Delete:
-		return d.applyDelete(req.Delete, entry, kvWB)
-	case raft_cmdpb.CmdType_Snap:
-		return d.applySnap(entry)
+// applyAdminRequest 应用管理员请求
+func (d *peerMsgHandler) applyAdminRequest(admin_req *raft_cmdpb.AdminRequest) error {
+	switch admin_req.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
+		return d.applyCompactLog(admin_req)
 	default:
-		log.Warnf("%s unknown command type: %v", d.Tag, req.CmdType)
+		log.Errorf("%s unknown admin request type: %v", d.Tag, admin_req.CmdType)
 		return nil
 	}
+}
+
+// applyNormalRequests 应用常规客户端请求
+func (d *peerMsgHandler) applyNormalRequests(requests []*raft_cmdpb.Request, entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) error {
+	var err error = nil
+	for _, req := range requests {
+		switch req.CmdType {
+		case raft_cmdpb.CmdType_Put:
+			err = d.applyPut(req.Put, entry, kvWB)
+		case raft_cmdpb.CmdType_Get:
+			err = d.applyGet(req.Get, entry)
+		case raft_cmdpb.CmdType_Delete:
+			err = d.applyDelete(req.Delete, entry, kvWB)
+		case raft_cmdpb.CmdType_Snap:
+			err = d.applySnap(entry)
+		default:
+			log.Warnf("%s unknown command type: %v", d.Tag, req.CmdType)
+			err = fmt.Errorf("%s unknown command type: %v", d.Tag, req.CmdType)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyPut 应用 Put 请求
@@ -228,6 +268,18 @@ func (d *peerMsgHandler) applySnap(entry *eraftpb.Entry) error {
 			Region: d.Region(),
 		},
 	}}, entry)
+}
+
+// applyCompactLog 应用日志压缩请求
+func (d *peerMsgHandler) applyCompactLog(req *raft_cmdpb.AdminRequest) error {
+	log.Infof("%s applied CompactLog", d.Tag)
+	compactLog := req.CompactLog
+	if compactLog.CompactIndex > d.peerStorage.applyState.TruncatedState.Index {
+		d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+		d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+		d.ScheduleCompactLog(compactLog.CompactIndex)
+	}
+	return nil
 }
 
 // respondToProposal 向提议回调返回响应
@@ -349,56 +401,82 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
+	// 处理管理员请求或者普通客户端请求
+	if msg.AdminRequest != nil {
+		d.proposeAdminRequest(msg)
+	} else {
+		d.proposeNormalRequests(msg, cb)
+	}
+}
 
-	// Your Code Here (2B).
-	for _, req := range msg.Requests {
-		var key []byte
-		// 根据请求类型提取相应的 key
-		switch req.CmdType {
-		case raft_cmdpb.CmdType_Put:
-			key = req.Put.Key
-		case raft_cmdpb.CmdType_Get:
-			key = req.Get.Key
-		case raft_cmdpb.CmdType_Delete:
-			key = req.Delete.Key
-		}
-
-		// 检查该 key 是否在当前 Region 中有效
-		err = util.CheckKeyInRegion(key, d.Region())
-		if err != nil {
-			log.Warnf("%s key %s is not valid in current region: %v", d.Tag, key, err)
-			// 如果 key 无效，调用回调并返回错误响应
-			cb.Done(ErrResp(err))
-			continue
-		}
-
+// proposeAdminRequest 处理管理员请求，没有回调函数
+func (d *peerMsgHandler) proposeAdminRequest(msg *raft_cmdpb.RaftCmdRequest) {
+	adminReq := msg.AdminRequest
+	switch adminReq.CmdType {
+	case raft_cmdpb.AdminCmdType_CompactLog:
 		// 将请求序列化为字节数组，以便向 Raft 集群提议
 		data, err := msg.Marshal()
 		if err != nil {
 			log.Errorf("%s failed to marshal RaftCmdRequest: %v", d.Tag, err)
-			// 序列化失败，调用回调并返回错误响应
-			cb.Done(ErrResp(err))
-			continue
+			return
 		}
-
-		// 提议数据到 Raft 集群，触发 Raft 的日志复制过程
-		err = d.RaftGroup.Propose(data)
-		if err != nil {
-			log.Errorf("%s proposal failed: %v", d.Tag, err)
-			// 提议失败，调用回调并返回错误响应
-			cb.Done(ErrResp(err))
-			continue
-		}
-
-		// 创建一个新的提议，将其添加到提议队列中
-		d.proposals = append(d.proposals, &proposal{
-			index: d.nextProposalIndex() - 1, // 当前提议的索引
-			term:  d.Term(),                  // 当前任期
-			cb:    cb,                        // 当前回调函数
-		})
-
-		log.Infof("%s successfully proposed command for key: %s", d.Tag, key)
+		d.proposeToRaft(&data, nil)
+	default:
+		log.Errorf("%s unknown admin request type: %v", d.Tag, adminReq.CmdType)
 	}
+}
+
+// proposeNormalRequests 处理普通客户端请求，需要回调
+func (d *peerMsgHandler) proposeNormalRequests(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
+	requests := msg.Requests
+	for _, req := range requests {
+		// 先检查 key 是否在当前 Region 中有效，无效直接返回失败
+		if err := d.checkKeyValidity(req); err != nil {
+			log.Warnf("%s key validation failed: %v", d.Tag, err)
+			cb.Done(ErrResp(err))
+			return
+		}
+	}
+	// 将请求序列化为字节数组，以便向 Raft 集群提议
+	data, err := msg.Marshal()
+	if err != nil {
+		log.Errorf("%s failed to marshal RaftCmdRequest: %v", d.Tag, err)
+		return
+	}
+	d.proposeToRaft(&data, cb)
+}
+
+// checkKeyValidity 检查 key 是否在当前 Region 中有效
+func (d *peerMsgHandler) checkKeyValidity(req *raft_cmdpb.Request) error {
+	var key []byte
+	switch req.CmdType {
+	case raft_cmdpb.CmdType_Put:
+		key = req.Put.Key
+	case raft_cmdpb.CmdType_Get:
+		key = req.Get.Key
+	case raft_cmdpb.CmdType_Delete:
+		key = req.Delete.Key
+	case raft_cmdpb.CmdType_Snap:
+	default:
+		return fmt.Errorf("unknown command type: %v", req.CmdType)
+	}
+	return util.CheckKeyInRegion(key, d.Region())
+}
+
+// proposeToRaft 提议数据到 Raft 集群
+func (d *peerMsgHandler) proposeToRaft(data *[]byte, cb *message.Callback) {
+	err := d.RaftGroup.Propose(*data)
+	if err != nil {
+		log.Errorf("%s proposal failed: %v", d.Tag, err)
+		cb.Done(ErrResp(err))
+		return
+	}
+	// 创建一个新的提议，将其添加到提议队列中
+	d.proposals = append(d.proposals, &proposal{
+		index: d.nextProposalIndex() - 1, // 当前提议的索引
+		term:  d.Term(),                  // 当前任期
+		cb:    cb,                        // 当前回调函数
+	})
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -472,6 +550,9 @@ func (d *peerMsgHandler) onRaftMsg(msg *rspb.RaftMessage) error {
 		// delete them here. If the snapshot file will be reused when
 		// receiving, then it will fail to pass the check again, so
 		// missing snapshot files should not be noticed.
+		// 如果快照文件不再被使用，那么在这里删除它们是可以的。
+		// 如果快照文件将在接收时被重用，则它将无法再次通过检查，
+		// 因此，缺失的快照文件不应该被关注。
 		s, err1 := d.ctx.snapMgr.GetSnapshotForApplying(*key)
 		if err1 != nil {
 			return err1

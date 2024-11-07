@@ -203,6 +203,12 @@ func (rn *RawNode) Ready() (rd Ready) {
 
 	// 获取当前时刻节点不稳定的日志条目
 	rd.Entries = raft.RaftLog.unstableEntries()
+
+	// 获取当前时刻的快照，如果有
+	if !IsEmptySnap(raft.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *raft.RaftLog.pendingSnapshot
+	}
+
 	// 获取当前时刻节点已经提交的日志条目
 	rd.CommittedEntries = raft.RaftLog.nextEnts()
 	// 获取当前时刻节点需要发出的消息
@@ -222,6 +228,10 @@ func (rn *RawNode) HasReady() bool {
 	}
 	// 非易失状态是否改变
 	if hardState := raft.hardState(); !isHardStateEqual(hardState, rn.prevHardState) {
+		return true
+	}
+	// 是否有快照
+	if !IsEmptySnap(raft.RaftLog.pendingSnapshot) {
 		return true
 	}
 	// 是否有待持久化的日志条目或待处理的消息
@@ -246,9 +256,14 @@ func (rn *RawNode) Advance(rd Ready) {
 	if len(rd.CommittedEntries) > 0 {
 		raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
 		// 把已经应用到状态机的日志条目移除
-		raft.RaftLog.entries = raft.RaftLog.entries[raft.RaftLog.applied-raft.RaftLog.FirstIndex()+1:]
+		// 出现日志重复的 bug，暂时先注释
+		// raft.RaftLog.entries = raft.RaftLog.entries[raft.RaftLog.applied-raft.RaftLog.FirstIndex()+1:]
 	}
 
+	// 尝试压缩日志
+	raft.RaftLog.maybeCompact()
+	// 快照记得删除
+	raft.RaftLog.pendingSnapshot = nil
 	// 消息处理完了，清空消息
 	raft.msgs = make([]pb.Message, 0)
 }

@@ -98,6 +98,7 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 
 func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if err := ps.checkRange(low, high); err != nil || low == high {
+		log.Errorf("%s Error: invalid range - low: %d, high: %d, err: %v", ps.Tag, low, high, err)
 		return nil, err
 	}
 	buf := make([]eraftpb.Entry, 0, high-low)
@@ -136,6 +137,7 @@ func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	}
 	// Here means we don't fetch enough entries.
 	// 这里表示我们没有获取到足够的条目。
+	log.Debugf("%s Not enough entries fetched. Expected: %d, Got: %d", ps.Tag, high-low, len(buf))
 	return nil, raft.ErrUnavailable
 }
 
@@ -365,6 +367,7 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 }
 
 // Apply the peer with given snapshot
+// ApplySnapshot 应用给定快照到 PeerStorage
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
 	snapData := new(rspb.RaftSnapshotData)
@@ -376,18 +379,68 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+	// 提示：在这里需要执行的操作包括：
+	// 1. 更新 peer 存储状态，比如 raftState 和 applyState 等
+	// 2. 通过 ps.regionSched 发送 RegionTaskApply 任务到区域工作线程
+	// 3. 调用 ps.clearMeta 和 ps.clearExtraData 删除过时的数据
+	// 4. 处理完成后，返回 ApplySnapResult 结果和任何可能的错误
+
+	// 删除过时的数据
+	if err := ps.clearMeta(kvWB, raftWB); err != nil {
+		return nil, err
+	}
+	ps.clearExtraData(snapData.Region)
+
+	// 更新 peer 存储状态
+	snapMeta := snapshot.Metadata
+	ps.raftState.LastIndex = snapMeta.Index
+	ps.raftState.LastTerm = snapMeta.Term
+	ps.applyState.AppliedIndex = snapMeta.Index
+	ps.applyState.TruncatedState.Index = snapMeta.Index
+	ps.applyState.TruncatedState.Term = snapMeta.Term
+	ps.snapState.StateType = snap.SnapState_Applying
+
+	// 更新区域的状态
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+
+	// 向 region worker 发送 runner.RegionTaskApply 任务，并等待 region worker 完成
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.Id,
+		Notifier: ch,
+		SnapMeta: snapMeta,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
+	}
+	if !(<-ch) {
+		return nil, nil
+	}
+
+	// 返回快照应用结果
+	return &ApplySnapResult{
+		PrevRegion: ps.Region(),
+		Region:     snapData.Region,
+	}, nil
 }
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 // 将内存状态保存到磁盘。
 // 在此函数中不要修改 ready，这是后续正确推进 ready 对象的要求。
-func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
+func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (applySnapResult *ApplySnapResult, err error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
 	// 用于写入 raft 数据的 batch
+	kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
+
+	// 如果快照不为空，先应用快照
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		applySnapResult, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// 如果硬状态不为空，则更新节点的 ps.raftState
 	if !raft.IsEmptyHardState(ready.HardState) {
@@ -395,24 +448,32 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 
 	// 将不稳定的日志条目写入 batch，同时更新节点的 ps.raftState
-	err := ps.Append(ready.Entries, raftWB)
+	err = ps.Append(ready.Entries, raftWB)
 	if err != nil {
 		return nil, err
 	}
 
 	// 将节点新的 ps.raftState 写入 batch，注意要在所有改动完成后再写入
-	err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
-	if err != nil {
+	if err = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
 		return nil, err
 	}
 
-	// batch 中的数据以事务的方式原子地写入数据库
-	err = ps.Engines.WriteRaft(raftWB)
-	if err != nil {
+	// 将节点新的 ps.applyState 写入 batch，注意要在所有改动完成后再写入
+	if err = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
 		return nil, err
 	}
 
-	return nil, nil
+	// raft batch 中的数据以事务的方式原子地写入数据库
+	if err = ps.Engines.WriteRaft(raftWB); err != nil {
+		return nil, err
+	}
+
+	// kv batch 中的数据以事务的方式原子地写入数据库
+	if err = ps.Engines.WriteKV(kvWB); err != nil {
+		return nil, err
+	}
+
+	return
 }
 
 func (ps *PeerStorage) ClearData() {

@@ -290,7 +290,13 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := peer.Next - 1
 	prevLogTerm, err := r.RaftLog.Term(prevLogIndex)
 	if err != nil {
-		log.Errorf("Failed to get term for index %d: %v", prevLogIndex, err)
+		if err == ErrCompacted || err == ErrUnavailable {
+			// 如果要发的日志条目已经被压缩了，说明跟随者快照落后了，直接发快照
+			// 某个测试里使用了 MemoryStorage，会返回 ErrUnavailable，实际上是被压缩了
+			return r.sendSnapshot(to)
+		}
+		// 否则报错
+		log.Panicf("%d failed to get term for index %d: %v", r.id, prevLogIndex, err)
 		return false
 	}
 
@@ -366,6 +372,36 @@ func (r *Raft) sendHeartbeatResponse(to uint64) {
 		From:    r.id,
 		Term:    r.Term,
 	})
+}
+
+// sendSnapshot 领导者发送快照 RPC
+func (r *Raft) sendSnapshot(to uint64) bool {
+	var err error
+	var snapshot pb.Snapshot
+
+	if IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		// 生成一份快照，可能失败
+		snapshot, err = r.RaftLog.storage.Snapshot()
+		if err != nil {
+			log.Errorf("%d failed to generate snapshot: %v", r.id, err)
+			return false
+		}
+	} else {
+		// 使用挂起的快照
+		snapshot = *r.RaftLog.pendingSnapshot
+	}
+
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Snapshot: &snapshot,
+	})
+
+	log.Debugf("%d sent snapshot(index: %d, term: %d) to %d at term %d", r.id, snapshot.Metadata.Index, snapshot.Metadata.Term, to, r.Term)
+
+	return true
 }
 
 func (r *Raft) startElection() {
@@ -588,7 +624,8 @@ func (r *Raft) StepFollower(m pb.Message) error {
 	case pb.MessageType_MsgRequestVote: // 跟随者处理来自其他候选者节点的选举投票请求
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: // 仅候选者处理
-	case pb.MessageType_MsgSnapshot: // 暂不处理
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat: // 跟随者处理来自领导者的心跳消息
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // 仅领导者处理
@@ -615,7 +652,8 @@ func (r *Raft) StepCandidate(m pb.Message) error {
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: // 候选者处理其他节点的选票请求回复
 		r.handleRequestVoteResponse(m)
-	case pb.MessageType_MsgSnapshot: // 暂不处理
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat: // 候选者处理来自某任期领导者的心跳消息
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // 仅领导者处理
@@ -643,7 +681,8 @@ func (r *Raft) StepLeader(m pb.Message) error {
 	case pb.MessageType_MsgRequestVote: // 领导者处理选举投票请求，其他候选者节点发过来的
 		r.handleRequestVote(m)
 	case pb.MessageType_MsgRequestVoteResponse: // 只有候选者处理选举投票回复
-	case pb.MessageType_MsgSnapshot: // 暂不处理
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgHeartbeat: // 领导者处理心跳消息，可能是其他任期的领导者发过来的
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // 领导者处理心跳消息回复，记录哪些节点还存活
@@ -936,6 +975,67 @@ func (r *Raft) handlePropose(m pb.Message) {
 // handleSnapshot 处理快照 RPC 请求。
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	log.Debugf("%d receive snapshot from %d for term %d", r.id, m.From, m.Term)
+
+	// 来自过期的领导者消息，直接拒绝
+	if m.Term < r.Term {
+		log.Debugf("%d reject snapshot from %d due to stale term: received %d, current %d", r.id, m.From, m.Term, r.Term)
+		r.sendAppendResponse(m.From, r.RaftLog.LastIndex(), true)
+		return
+	}
+
+	// 当前领导者过期，更新任期，回退为跟随者
+	if m.Term > r.Term || r.State != StateFollower {
+		r.becomeFollower(m.Term, m.From)
+	}
+
+	snapMeta := m.Snapshot.Metadata
+	snapIndex := snapMeta.Index
+	snapTerm := snapMeta.Term
+
+	// 快照过期，忽略
+	// 如果已经提交的日志索引大于等于快照中的日志索引，那么拒绝这次快照
+	// 因为 commit 的日志必定会被 apply，如果被快照中的日志覆盖的话就会破坏一致性
+	if snapIndex <= r.RaftLog.committed {
+		log.Debugf("%d ignore stale snapshot: index %d is less than or equal committed %d", r.id, snapIndex, r.RaftLog.committed)
+		return
+	}
+
+	// 不如直接全清空
+	r.RaftLog.entries = r.RaftLog.entries[:0]
+	r.RaftLog.entries = append(r.RaftLog.entries, pb.Entry{
+		EntryType: pb.EntryType_EntryNormal,
+		Term:      snapTerm,
+		Index:     snapIndex,
+	})
+
+	lastIndex := r.RaftLog.LastIndex()
+
+	// 集群节点发生变更
+	if snapMeta.ConfState != nil {
+		nodes := snapMeta.ConfState.Nodes
+		log.Debugf("%d cluster configuration updated with nodes: %v", r.id, nodes)
+		r.Prs = make(map[uint64]*Progress, len(nodes))
+		for _, p := range nodes {
+			r.Prs[p] = &Progress{
+				Match: 0,
+				Next:  lastIndex + 1,
+			}
+			if p == r.id {
+				r.Prs[p].Match = lastIndex
+			}
+		}
+	}
+
+	r.RaftLog.committed = snapIndex
+	r.RaftLog.applied = snapIndex
+	r.RaftLog.stabled = snapIndex
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	log.Debugf("%d updated committed, applied, and stabled indices to %d", r.id, snapIndex)
+
+	// 当成附加日志请求，返回附加日志成功回复
+	r.sendAppendResponse(m.From, lastIndex, false)
 }
 
 // updateCommittedIndex 更新 committedIndex

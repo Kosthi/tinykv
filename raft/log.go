@@ -89,10 +89,10 @@ func newLog(storage Storage) *RaftLog {
 	}
 
 	// 从存储加载条目，直到已提交的索引
-	entries, err := storage.Entries(firstIndex, lastIndex+1)
-	if err != nil {
-		panic(err.Error())
-	}
+	entries, _ := storage.Entries(firstIndex, lastIndex+1)
+	//if err != nil {
+	//	panic(err.Error())
+	//}
 
 	// 创建新的 RaftLog 实例
 	raftLog := &RaftLog{
@@ -113,6 +113,19 @@ func newLog(storage Storage) *RaftLog {
 // 我们需要在某个时间点对日志条目进行压缩，以便存储稳定的日志条目，防止日志条目在内存中无限增长。
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	storageFirstIndex, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err.Error())
+	}
+	if len(l.entries) > 0 {
+		firstIndex := l.FirstIndex()
+		lastIndex := l.LastIndex()
+		if storageFirstIndex > lastIndex {
+			l.entries = l.entries[:0]
+		} else if storageFirstIndex >= firstIndex {
+			l.entries = l.entries[storageFirstIndex-firstIndex:]
+		}
+	}
 }
 
 func (l *RaftLog) Entry(index uint64) *pb.Entry {
@@ -232,8 +245,8 @@ func (l *RaftLog) truncateBelow(index uint64) {
 	// 确保索引在当前日志范围内
 	firstIndex := l.FirstIndex()
 	if index >= firstIndex && index <= l.LastIndex() {
-		l.entries = l.entries[:index-firstIndex]     // 截取到 index-firstIndex
-		l.stabled = min(l.stabled, index-firstIndex) // 更新稳定的日志索引
+		l.entries = l.entries[:index-firstIndex] // 截取到 index-firstIndex
+		l.stabled = min(l.stabled, index-1)      // 更新稳定的日志索引
 	}
 }
 
