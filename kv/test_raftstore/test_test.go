@@ -54,6 +54,7 @@ func NextValue(prev string, val string) string {
 
 // check that for a specific client all known appends are present in a value,
 // and in order
+// 检查对于特定客户端，所有已知的追加内容是否都在某个值中，并且顺序正确。
 func checkClntAppends(t *testing.T, clnt int, v string, count int) {
 	lastoff := -1
 	for j := 0; j < count; j++ {
@@ -142,6 +143,14 @@ func confchanger(t *testing.T, cluster *Cluster, ch chan bool, done *int32) {
 // - If maxraftlog is a positive number, the count of the persistent log for Raft shouldn't exceed 2*maxraftlog.
 // - If confchange is set, the cluster will schedule random conf change concurrently.
 // - If split is set, split region when size exceed 1024 bytes.
+// 基本测试如下：一个或多个客户端向一组服务器提交 Put/Scan 操作，持续一段时间。
+// 在时间结束后，测试检查特定键的所有顺序值是否存在并且有序，并执行 Delete 以清理。
+// - 如果设置了 unreliable，则 RPC 调用可能会失败。
+// - 如果设置了 crash，则服务器将在时间结束后重启。
+// - 如果设置了 partitions，测试将在服务器之间并发地重新分区网络。
+// - 如果 maxraftlog 为正数，则 Raft 持久日志的计数不应超过 2*maxraftlog。
+// - 如果设置了 confchange，集群将并发调度随机的配置改变。
+// - 如果设置了 split，当大小超过 1024 字节时拆分区域。
 func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash bool, partitions bool, maxraftlog int, confchange bool, split bool) {
 	title := "Test: "
 	if unreliable {
@@ -181,6 +190,7 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 
 	electionTimeout := cfg.RaftBaseTickInterval * time.Duration(cfg.RaftElectionTimeoutTicks)
 	// Wait for leader election
+	// 等待领导者选举
 	time.Sleep(2 * electionTimeout)
 
 	done_partitioner := int32(0)
@@ -260,9 +270,11 @@ func GenericTest(t *testing.T, part string, nclients int, unreliable bool, crash
 			}
 			// Wait for a while for servers to shutdown, since
 			// shutdown isn't a real crash and isn't instantaneous
+			// 等待一段时间，以便服务器能够关闭，因为关闭并不是一次真正的崩溃，并且不是瞬时完成的
 			time.Sleep(electionTimeout)
 			log.Warnf("restart servers\n")
 			// crash and re-start all
+			// 崩溃并重新启动所有服务器
 			for i := 1; i <= nservers; i++ {
 				cluster.StartServer(uint64(i))
 			}
@@ -347,6 +359,8 @@ func TestUnreliable2B(t *testing.T) {
 // Submit a request in the minority partition and check that the requests
 // doesn't go through until the partition heals.  The leader in the original
 // network ends up in the minority partition.
+// 在少数分区中提交请求，并检查在分区恢复之前不会通过的请求。
+// 原始网络中的领导者最终位于少数分区中。
 func TestOnePartition2B(t *testing.T) {
 	cfg := config.NewTestConfig()
 	cluster := NewTestCluster(5, cfg)
@@ -357,6 +371,7 @@ func TestOnePartition2B(t *testing.T) {
 	leader := cluster.LeaderOfRegion(region.GetId())
 	s1 := []uint64{leader.GetStoreId()}
 	s2 := []uint64{}
+	// 将领导者和其他 2 个节点置于 s1 分区，剩下 2 个节点置于 s2 分区
 	for _, p := range region.GetPeers() {
 		if p.GetId() == leader.GetId() {
 			continue
@@ -369,6 +384,7 @@ func TestOnePartition2B(t *testing.T) {
 	}
 
 	// leader in majority, partition doesn't affect write/read
+	// 领导者在大多数节点中，分区不会影响写入/读取操作
 	cluster.AddFilter(&PartitionFilter{
 		s1: s1,
 		s2: s2,
@@ -380,6 +396,7 @@ func TestOnePartition2B(t *testing.T) {
 	cluster.ClearFilters()
 
 	// old leader in minority, new leader should be elected
+	// 旧的领导者在少数分区 s1 中，s2 分区应该选举新的领导者
 	s2 = append(s2, s1[2])
 	s1 = s1[:2]
 	cluster.AddFilter(&PartitionFilter{
@@ -393,6 +410,7 @@ func TestOnePartition2B(t *testing.T) {
 	cluster.ClearFilters()
 
 	// when partition heals, old leader should sync data
+	// 当分区恢复时，旧的领导者应该下台并同步数据
 	cluster.MustPut([]byte("k2"), []byte("v2"))
 	MustGetEqual(cluster.engines[s1[0]], []byte("k2"), []byte("v2"))
 	MustGetEqual(cluster.engines[s1[0]], []byte("k1"), []byte("changed"))
