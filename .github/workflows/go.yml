@@ -30,3 +30,6 @@ jobs:
 
     - name: Test Project 2C
       run: make project2c_ci
+
+    - name: Test Project 3A
+      run: make project3a
