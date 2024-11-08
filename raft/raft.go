@@ -629,8 +629,10 @@ func (r *Raft) StepFollower(m pb.Message) error {
 	case pb.MessageType_MsgHeartbeat: // 跟随者处理来自领导者的心跳消息
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // 仅领导者处理
-	case pb.MessageType_MsgTransferLeader: // 暂不处理
-	case pb.MessageType_MsgTimeoutNow: // 暂不处理
+	case pb.MessageType_MsgTransferLeader: // 跟随者转发消息给领导者或者转移领导权到新的节点（如果上一次转移还未完成）
+		r.handleTransferLeader(m)
+	case pb.MessageType_MsgTimeoutNow: // 领导权转移完成后发出，接收的节点立即开始选举
+		r.handleTimeoutNow(m)
 	}
 	return err
 }
@@ -673,7 +675,7 @@ func (r *Raft) StepLeader(m pb.Message) error {
 	case pb.MessageType_MsgBeat: // 领导者接收 Beat 消息向其他节点发生心跳
 		r.sendAllHeartbeat()
 	case pb.MessageType_MsgPropose: // 处理客户端的提议将数据附加至领导者的日志条目
-		r.handlePropose(m)
+		err = r.handlePropose(m)
 	case pb.MessageType_MsgAppend: // 领导者处理追加条目请求，可能是其他任期的领导者发过来的
 		r.handleAppendEntries(m)
 	case pb.MessageType_MsgAppendResponse: // 领导者处理追加条目消息回复
@@ -687,7 +689,8 @@ func (r *Raft) StepLeader(m pb.Message) error {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgHeartbeatResponse: // 领导者处理心跳消息回复，记录哪些节点还存活
 		r.handleHeartbeatResponse(m)
-	case pb.MessageType_MsgTransferLeader: // 暂不处理
+	case pb.MessageType_MsgTransferLeader: // 领导者转移领导权到新的节点
+		r.handleTransferLeader(m)
 	case pb.MessageType_MsgTimeoutNow: // 暂不处理
 	}
 	return err
@@ -804,6 +807,16 @@ func (r *Raft) handleAppendResponse(m pb.Message) {
 		}
 	} else {
 		log.Debugf("%d ignoring appendResponse for index %d as log term %d does not match current term %d", r.id, m.Index, logTerm, r.Term)
+	}
+
+	if r.leadTransferee == m.From {
+		r.becomeFollower(m.Term, m.From)
+		// 发送 MessageType_MsgTimeoutNow 消息，让被转移者立即开始选举
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			To:      m.From,
+			From:    r.id,
+		})
 	}
 }
 
@@ -952,8 +965,13 @@ func (r *Raft) appendEntry(entries []*pb.Entry) {
 }
 
 // handlePropose 处理客户端提议的日志条目
-func (r *Raft) handlePropose(m pb.Message) {
+func (r *Raft) handlePropose(m pb.Message) error {
 	log.Debugf("%d receive propose from %d: %v", r.id, m.From, m.Entries)
+
+	// 正在进行领导者转移，停止接受新的提案以防止循环
+	if r.leadTransferee != None {
+		return ErrProposalDropped
+	}
 
 	// 追加日志条目
 	r.appendEntry(m.Entries)
@@ -969,6 +987,8 @@ func (r *Raft) handlePropose(m pb.Message) {
 		// 发送附加条目请求给其他节点
 		r.sendAllAppend()
 	}
+
+	return nil
 }
 
 // handleSnapshot handle Snapshot RPC request
@@ -1043,14 +1063,18 @@ func (r *Raft) updateCommittedIndex() bool {
 	var N uint64 = 0
 
 	totalNodes := len(r.Prs)
-	// 特殊处理两个节点的情况（一个节点直接更新）
-	if totalNodes == 2 {
+	switch totalNodes {
+	case 1:
+		// 特殊处理一个节点的情况，直接赋值 nextMatch
+		N = r.Prs[r.id].Match
+	case 2:
+		// 特殊处理两个节点的情况，取最小
 		var minMatch uint64 = math.MaxUint64
 		for _, process := range r.Prs {
 			minMatch = min(minMatch, process.Match)
 		}
 		N = minMatch
-	} else {
+	default:
 		// 三个及以上节点
 		currentTerm := r.Term            // 缓存 currentTerm，减少结构体字段访问
 		majority := (totalNodes + 1) / 2 // 定义达到大多数所需的数量
@@ -1085,14 +1109,101 @@ func (r *Raft) updateCommittedIndex() bool {
 	return false
 }
 
+// handleTransferLeader 处理领导者更改 RPC 请求。
+func (r *Raft) handleTransferLeader(m pb.Message) {
+	// Your Code Here (3A).
+	log.Debugf("%d received leader transfer message from %d: %+v", r.id, m.From, m)
+
+	// 转移目标节点不存在
+	if !r.isNodeInGroup(m.From) {
+		return
+	}
+
+	// 如果当前节点不是领导者，尝试转发消息给领导者
+	if r.State != StateLeader {
+		// 领导者转移完成了，转发消息
+		if r.Lead != None {
+			m.To = r.Lead
+			r.msgs = append(r.msgs, m)
+			log.Debugf("%d forwarded message to leader %d", r.id, r.Lead)
+			return
+		} else {
+			// 还没有转移完成，转移领导权到新的节点
+			log.Warnf("%d failed to forward message: no active leader available. Current state: %v", r.id, r.State)
+		}
+	} else if r.id == m.From {
+		// 领导者转移领导权给自己，视为空操作
+		return
+	}
+
+	// 领导权转移
+	r.leadTransferee = m.From
+
+	// 被转移者的日志是否一样新
+	if r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+		log.Debugf("%d Leader transfer approved: %d will become the leader (match index: %d)", r.id, m.From, r.RaftLog.LastIndex())
+		// 领导者同意了转移，要立即下台成为跟随者
+		r.becomeFollower(m.Term, None)
+		// 发送 MessageType_MsgTimeoutNow 消息，让被转移者立即开始选举
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgTimeoutNow,
+			To:      m.From,
+			From:    r.id,
+		})
+	} else {
+		log.Debugf("%d Leader transfer in progress: sending append to %d to catch up logs", r.id, m.From)
+		// 否则帮助被转移者完成日志更新
+		r.sendAppend(m.From)
+	}
+}
+
+// handleTimeoutNow 处理选举立即超时 RPC 请求。
+func (r *Raft) handleTimeoutNow(m pb.Message) {
+	// Your Code Here (3A).
+	log.Debugf("%d received TimeoutNow message from %d", r.id, m.From)
+	// 检查节点是否在集群中，如果不在，则返回
+	if !r.isNodeInGroup(m.To) {
+		return
+	}
+	// 在收到 TimeoutNow 消息后，被转移者应立即开始新的选举，无论其选举超时如何
+	r.startElection()
+}
+
 // addNode add a new node to raft group
 // addNode 向 Raft 集群添加一个新节点。
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if r.isNodeInGroup(id) {
+		return
+	}
+	r.Prs[id] = &Progress{
+		Match: 0,
+		Next:  r.RaftLog.LastIndex() + 1,
+	}
 }
 
 // removeNode remove a node from raft group
 // removeNode 从 Raft 集群中移除一个节点。
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if !r.isNodeInGroup(id) {
+		return
+	}
+	delete(r.Prs, id)
+	if r.State == StateLeader {
+		// 尝试更新 committed，如果更新了，向所有节点再发一个 Append，用于同步 committed
+		if r.updateCommittedIndex() {
+			log.Debugf("%d committed index updated, sending AppendEntries to all peers", r.id)
+			r.sendAllAppend()
+		}
+	}
+}
+
+// isNodeInGroup 检查指定节点 id 是否在当前 Raft 集群中。
+func (r *Raft) isNodeInGroup(id uint64) bool {
+	_, exists := r.Prs[id]
+	if !exists {
+		log.Errorf("%d is NOT in the Raft group", id)
+	}
+	return exists
 }
