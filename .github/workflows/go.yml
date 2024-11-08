@@ -26,7 +26,7 @@ jobs:
       run: make project2a
 
     - name: Test Project 2B
-      run: make project2b
+      run: make project2b_ci
 
     - name: Test Project 2C
-      run: make project2c
+      run: make project2c_ci

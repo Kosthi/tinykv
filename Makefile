@@ -83,6 +83,21 @@ project2b:
 	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartitionUnreliable2B$ || true
 	$(TEST_CLEAN)
 
+project2b_ci:
+	$(TEST_CLEAN)
+	$(GOTEST) ./kv/test_raftstore -run ^TestBasic2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestConcurrent2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestUnreliable2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestOnePartition2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestManyPartitionsOneClient2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestManyPartitionsManyClients2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistOneClient2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistConcurrent2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistConcurrentUnreliable2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartition2B$
+	$(GOTEST) ./kv/test_raftstore -run ^TestPersistPartitionUnreliable2B$
+	$(TEST_CLEAN)
+
 project2c:
 	$(TEST_CLEAN)
 	$(GOTEST) ./raft -run 2C || true
@@ -92,6 +107,17 @@ project2c:
 	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliable2C$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecover2C$ || true
 	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ || true
+	$(TEST_CLEAN)
+
+project2c_ci:
+	$(TEST_CLEAN)
+	$(GOTEST) ./raft -run 2C
+	$(GOTEST) ./kv/test_raftstore -run ^TestOneSnapshot2C$
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotRecover2C$
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotRecoverManyClients2C$
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliable2C$
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecover2C$
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$
 	$(TEST_CLEAN)
 
 project3: project3a project3b project3c
